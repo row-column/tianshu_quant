@@ -46,6 +46,11 @@ class SimulatedExecutionHandler(ExecutionHandler):
                     quantity=event.quantity,
                     direction=event.direction,
                     fill_cost=fill_cost,
+                    # initial_price 和 avg_cost 对于首次买入，就是成交价
+                    initial_price=fill_price,
+                    avg_cost=fill_price,
+                    # 作为忠实的“传话筒”，把风险信息原封不动地抄送
+                    initial_risk=event.initial_risk,
                     commission=commission
                 )
                 events.put(fill_event)

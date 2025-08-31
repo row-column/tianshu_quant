@@ -7,14 +7,14 @@ from enum import Enum, auto
 from datetime import datetime, timedelta,timezone, time as dt_time
 from typing import Optional
 import pytz
-from positions import MarketType
 from utils.cfg_utils import load_yaml2cfg
 
-# --- 模块级依赖与配置 ---
-cfg_file = os.path.join(project_path, 'data/server_config.yaml')
-cfg = load_yaml2cfg(cfg_file)
-
 # --- 核心数据结构 ---
+class MarketType(Enum):
+    """市场类型枚举"""
+    HK = "HK"
+    US = "US"
+    CN = "CN"
 
 # 定义各个市场的本地交易时间段
 MARKET_TRADING_HOURS = {
@@ -91,10 +91,6 @@ def is_any_market_open(symbol: str = None) -> bool:
     """
     [V2.0 健壮版] 检查是否有任何一个或指定市场处于交易时间内。
     """
-    # 移除了对全局 cfg 的依赖，测试模式应在调用方处理
-    if cfg.common.test_mode:
-        return True
-    
     current_utc_time = datetime.now(pytz.utc)
     
     if symbol:
@@ -112,14 +108,10 @@ def is_any_market_open(symbol: str = None) -> bool:
 
 def is_hk_market_open() -> bool:
     """[V2.0 健壮版] 检查港股市场是否开放"""
-    if cfg.common.test_mode:
-        return True
     return is_market_in_trading_hours(MarketType.HK)
 
 def is_us_market_open() -> bool:
     """[V2.0 健壮版] 检查美股市场是否开放"""
-    if cfg.common.test_mode:
-        return True
     return is_market_in_trading_hours(MarketType.US)
 
 def get_current_session(market_str: str) -> Optional[TradingSession]:
@@ -172,10 +164,6 @@ def is_in_eod_buy_window(market: MarketType, window_minutes: int = 30) -> bool:
     if market not in [MarketType.HK, MarketType.US]:
         return False
     
-    # 测试模式下，不激活尾盘窗口，让主逻辑 is_any_market_open 控制
-    if cfg.common.test_mode:
-        return False
-
     market_str = market.name
     market_info = MARKET_TRADING_HOURS.get(market_str)
     if not market_info or not market_info["sessions"]:
@@ -219,9 +207,6 @@ def is_in_opening_window(market: MarketType, window_minutes: int=30) -> bool:
     :param window_minutes: 开盘后多少分钟视为窗口期。
     :return: 如果在窗口期内则返回 True，否则返回 False。
     """
-    # 在测试模式下，时间窗口的概念没有意义，直接返回False，避免干扰回测逻辑。
-    if cfg.common.test_mode:
-        return False
 
     market_info = MARKET_TRADING_HOURS.get(market)
     # 如果没有市场信息或交易时段信息，直接返回False

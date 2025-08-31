@@ -13,10 +13,20 @@ import warnings
 warnings.filterwarnings("ignore")
 # --- 回测配置 ---
 # 确保这些股票的数据文件存在于 data/ 目录中
-symbol_list = ['0005.HK', '9988.HK',"00981.HK","01810.HK","07226.HK"]
-# symbol_list = ['AAPL.US', 'TSLA.US', 'NVDA.US']
-initial_capital = 100000.0
+# symbol_list = ['0005.HK', '9988.HK',"00981.HK","01810.HK","07226.HK"]
+symbol_list = [
+    '00002.HK', '01347.HK', '07200.HK', 'JNJ.US',
+    '00005.HK', '01357.HK', '07226.HK', 'JPM.US',
+    '00016.HK', '01398.HK', '09868.HK', 'LLYX.US',
+    '0005.HK', '01810.HK', '09988.HK', 'MSFU.US',
+    '00165.HK', '02359.HK', '09992.HK', 'PLTU.US',
+    '00268.HK', '02800.HK', '9988.HK', 'SOXL.US',
+    '00388.HK', '02899.HK', 'AAPU.US', 'TSLL.US',
+    '00981.HK', '03750.HK', 'AMDL.US', 'WMT.US',
+    '01024.HK', '06060.HK', 'AMZU.US'
+]
 
+initial_capital = 100000.0
 
 # --- 【核心修改】创建策略的“图纸和原材料”清单 ---
 praetorian_params = {

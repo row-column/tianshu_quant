@@ -64,8 +64,11 @@ class Backtest:
                     if event is not None:
                         if event.type == 'MARKET':
                             held_symbols = self.portfolio.get_held_symbols()
+                            # 构建一个包含完整持仓对象的字典
+                            positions_map = {s: self.portfolio.get_position(s) for s in held_symbols}
+                            # 将 positions_map 传递给所有策略
                             for strategy in self.strategy_list:
-                                strategy.calculate_signals(event, held_symbols)
+                                strategy.calculate_signals(event, held_symbols, positions_map)
                             self.portfolio.update_timeindex(event)
                         elif event.type == 'SIGNAL':
                             self.portfolio.on_signal(event)

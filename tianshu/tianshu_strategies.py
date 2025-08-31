@@ -7,6 +7,8 @@ import numpy as np
 from enum import Enum
 from typing import Tuple,Optional,Dict
 from .event import SignalEvent, events
+from datetime import datetime, timezone
+from utils.market_time_utils import normalize_to_utc
 
 # 这是一个改造后的策略基类，用于回测框架
 class BacktestStrategy:
@@ -19,8 +21,33 @@ class BacktestStrategy:
     def name(self):
         raise NotImplementedError
 
-    def calculate_signals(self, event,held_symbols: list):
+    def calculate_signals(self, event,held_symbols: list, positions: dict):
         raise NotImplementedError
+    
+    def calculate_atr_stop_loss(self, df_daily: pd.DataFrame,atr_stop_loss_multiplier:float = 1.8) -> Optional[float]:
+        """
+        100% 复刻你的 get_historical_atr 逻辑，但在回测数据上运行。
+        它计算并返回基于今日买入价和昨日ATR的精确止损价。
+        """
+        if df_daily is None or len(df_daily) < self.atr_period + 2:
+            return None
+            
+        try:
+            # 1. 获取“昨天”的ATR值 (iloc[-2])，这与你的实盘逻辑完全一致
+            yesterday_atr = df_daily.iloc[-2].get('atr')
+            if pd.isna(yesterday_atr) or yesterday_atr <= 0:
+                return None
+
+            # 2. 获取“今天”的价格作为买入基准。在日线回测中，通常使用收盘价模拟成交。
+            today_price = df_daily.iloc[-1]['close']
+
+            # 3. 计算单笔风险和止损价，公式与你实盘代码完全一致
+            atr_defined_risk = yesterday_atr * atr_stop_loss_multiplier
+            stop_loss_price = today_price - atr_defined_risk
+            return stop_loss_price
+        except Exception as e:
+            print(f"警告: ATR止损价计算失败. {e}")
+            return None
 
 # ==============================================================================
 # === 【V2.0 修复版】“禁卫军”全天候作战平台 (回测专用版) ===
@@ -49,6 +76,7 @@ class PraetorianStrategyForBacktest(BacktestStrategy):
         self.vcp_max_width_pct = kwargs.get('vcp_max_width_pct', 0.12)
         self.gap_min_pct = kwargs.get('gap_min_pct', 0.04)
         self.atr_multiplier_breakout = kwargs.get('atr_multiplier_breakout', 0.25)
+        self.atr_stop_loss_multiplier = kwargs.get('atr_stop_loss_multiplier', 1.8) # 默认值取自你实盘config
 
     @property
     def name(self):
@@ -78,7 +106,7 @@ class PraetorianStrategyForBacktest(BacktestStrategy):
             
         return df
 
-    def calculate_signals(self, event, held_symbols: list):
+    def calculate_signals(self, event, held_symbols: list, positions: dict):
         """
         现在只对 `symbol_list` 中 **不包含** 在 `held_symbols` 里的股票进行检查。
         """
@@ -101,14 +129,23 @@ class PraetorianStrategyForBacktest(BacktestStrategy):
                 if not is_triggered:
                     continue
 
+                # --- 在发送信号前，计算止损价 ---
+                # --- 【核心修改】在这里调用“火控计算机” ---
+                stop_loss_price = self.calculate_atr_stop_loss(df_daily)
+                
+                # 如果无法计算出科学的止损价，则放弃这次交易，这是专业风控的体现
+                if stop_loss_price is None:
+                    continue
+
                 current_timestamp = df_daily.index[-1]
                 print(
                     f"[{current_timestamp.strftime('%Y-%m-%d')}] ★★★ 买入信号 ★★★\n"
                     f"  - 股票: {s}\n"
                     f"  - 日线背景: {setup_type.value}\n"
-                    f"  - 作战命令: {trigger_info}"
+                    f"  - 作战命令: {trigger_info}\n"
+                    f"  - 科学止损价: {stop_loss_price:.2f}"
                     )
-                signal = SignalEvent(s, current_timestamp, 'LONG', strategy_name=self.name)
+                signal = SignalEvent(s, current_timestamp, 'LONG', strategy_name=self.name,stop_loss_price=stop_loss_price)
                 events.put(signal)
 
     def calculate_signals_v1(self, event):
@@ -267,23 +304,39 @@ class TrendFollowerSellStrategyForBacktest(BacktestStrategy):
     def __init__(self, data_handler, symbol_list, **kwargs):
         super().__init__(data_handler, symbol_list, **kwargs)
         self.ma_period = kwargs.get('ma_period', 20)
-        # --- 【新增】从参数接收 ATR 配置 ---
+        # --- 从参数接收 ATR 配置 ---
         self.atr_period = kwargs.get('atr_period', 14)
         self.atr_tolerance_multiplier = kwargs.get('atr_tolerance_multiplier', 0.5)
+        # --- 从参数接收蜜月期天数 ---
+        self.grace_period_days = kwargs.get('grace_period_days', 2)
         
     @property
     def name(self):
         return f"趋势跟踪止损-ATR容忍 ({self.ma_period}日线-回测版)"
 
-    def calculate_signals(self, event, held_symbols: list):
+    def calculate_signals(self, event, held_symbols: list, positions: dict):
         if event.type != 'MARKET': return
             
         for s in held_symbols:
-            # 需要的数据量取决于MA和ATR哪个周期更长
+            # --- 【核心修改】在这里获取持仓对象 ---
+            position = positions.get(s)
+            if not position:
+                continue # 如果因为某些原因找不到，就跳过
+            
+            # --- 【一级战地加固】---
+            # 先获取数据，再进行任何操作。并且只获取一次。
             required_bars = max(self.ma_period, self.atr_period) + 20
             df_daily = self.data_handler.get_latest_bars(s, N=required_bars)
-            if df_daily.empty or len(df_daily) < required_bars - 10:
+            
+            # 核心防御：如果连一根K线都没有，那就什么也别做了
+            if df_daily.empty:
                 continue
+            # --- 加固结束 ---
+
+            # current_timestamp = df_daily.index[-1]
+            # if self._is_in_grace_period(position, s, current_timestamp):
+            #     continue # 处于蜜月期，跳过该股票的卖出检查
+            # --- 新增结束 ---
 
             df_daily['ma'] = ta.sma(df_daily['close'], length=self.ma_period)
             df_daily['atr'] = ta.atr(df_daily['high'], df_daily['low'], df_daily['close'], length=self.atr_period)
@@ -313,3 +366,27 @@ class TrendFollowerSellStrategyForBacktest(BacktestStrategy):
                 )
                 signal = SignalEvent(s, current_timestamp, 'SHORT', strategy_name=self.name)
                 events.put(signal)
+    
+    # --- 【新增】将你提供的代码移植进来，并进行关键修改 ---
+    def _is_in_grace_period(self, position, symbol: str, current_timestamp: datetime) -> bool:
+        """
+        [回测版战术豁免模块]
+        - 【关键修改】使用回测引擎传入的 current_timestamp 替代 datetime.now()
+        """
+        try:
+            # 杠精注释：在我们的新架构下，position.entry_timestamp 就是一个datetime对象
+            entry_timestamp = position.entry_timestamp
+            
+            # --- 【核心修正】用当前回测时间来计算持仓天数 ---
+            holding_duration = current_timestamp - entry_timestamp
+            
+            if holding_duration.days < self.grace_period_days:
+                # 为了避免日志刷屏，可以只在第一次豁免时打印
+                # print(f"[{current_timestamp.strftime('%Y-%m-%d')}] [{self.name}] for {symbol}: [蜜月期豁免]")
+                return True
+
+        except Exception as e:
+            # print(f"[{self.name}][{symbol}] 检查蜜月期时出错: {e}")
+            return False
+
+        return False
