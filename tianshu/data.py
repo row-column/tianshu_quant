@@ -44,12 +44,16 @@ class HistoricDataHandler(DataHandler):
         # 对齐所有数据
         self.all_indices = combined_index.sort_values()
         # 【关键移除】不再 reindex 和 pad 数据
+        # 初始化每个股票的最新数据为一个空的DataFrame
         for s in self.symbol_list:
             # self.symbol_data[s] = self.symbol_data[s].reindex(index=self.all_indices, method='pad').dropna()
             # self.latest_symbol_data[s] = []
             self.latest_symbol_data[s] = pd.DataFrame() # 初始化为空DataFrame
 
     def get_latest_bars(self, symbol, N=1):
+        """
+        返回最新的N条数据。如果当天停牌，返回的就是昨天的数据。
+        """
         try:
             return self.latest_symbol_data[symbol].tail(N)
         except (KeyError, IndexError):

@@ -15,7 +15,10 @@ class BacktestPosition:
     entry_timestamp: datetime
     initial_price: float
     avg_cost: float
-    initial_risk: float
+    initial_risk_per_share: float # 每股初始风险 (1R)
+    entry_strategy_name: str # 【关键】记录是由哪个策略买入的
+    stop_loss_price: float
+    
 
 class Portfolio:
     """
@@ -76,6 +79,8 @@ class Portfolio:
         """
         响应 SignalEvent，现在可以处理买入和卖出两种信号。
         """
+        if event.type != 'SIGNAL': return
+        # --- 买入信号处理 ---
         if event.type == 'SIGNAL':
             if event.signal_type == 'LONG' and event.symbol not in self.current_holdings:
                 # --- 【核心修改】在这里计算 risk_per_share ---
@@ -95,34 +100,20 @@ class Portfolio:
                 
                 if quantity > 0:
                     # --- 【核心修改】将 risk_per_share 放入 OrderEvent ---
-                    order = OrderEvent(event.symbol, 'MKT', quantity, 'BUY', initial_risk=risk_per_share)
+                    order = OrderEvent(event.symbol, 
+                                       'MKT', 
+                                       quantity,
+                                       'BUY',
+                                       initial_risk=risk_per_share,
+                                       entry_strategy_name=event.strategy_name,
+                                       stop_loss_price=getattr(event, 'stop_loss_price', 0.0)
+                                       )
                     events.put(order)
             
             elif event.signal_type == 'SHORT' and event.symbol in self.current_holdings:
                 quantity = self.current_holdings[event.symbol].quantity
                 order = OrderEvent(event.symbol, 'MKT', quantity, 'SELL') # 卖出时不需要风险参数
                 events.put(order)
-
-    '''
-        if event.type == 'SIGNAL':
-            order_type = 'MKT'
-            
-            if event.signal_type == 'LONG':
-                # 检查是否已持仓，避免重复买入
-                if event.symbol not in self.current_holdings:
-                    quantity = self._calculate_position_size(event.symbol, event.stop_loss_price)
-                    # quantity = self._calculate_position_size(event.symbol)
-                    if quantity > 0:
-                        order = OrderEvent(event.symbol, order_type, quantity, 'BUY')
-                        events.put(order)
-            
-            # --- 卖出信号处理逻辑 ---
-            elif event.signal_type == 'SHORT':
-                if event.symbol in self.current_holdings:
-                    quantity = self.current_holdings[event.symbol].quantity
-                    order = OrderEvent(event.symbol, order_type, quantity, 'SELL')
-                    events.put(order)
-    '''
     
     def _calculate_position_size(self, price: float, risk_per_share: float) -> int:
         """(逻辑简化，职责更清晰)"""
@@ -170,30 +161,35 @@ class Portfolio:
         return quantity if quantity > 0 else 0
 
     def on_fill(self, event: FillEvent):
-        """ 现在会创建或销毁 BacktestPosition 对象。"""
-        if event.type == 'FILL':
-            if event.direction == 'BUY':
-                # --- 【核心修改】创建持仓对象 ---
-                position = BacktestPosition(
-                    symbol=event.symbol,
-                    quantity=event.quantity,
-                    entry_timestamp=event.datetime, # 成交时间就是建仓时间
-                    initial_price= event.initial_price,
-                    avg_cost= event.avg_cost,
-                    initial_risk= event.initial_risk
-                )
-                self.current_holdings[event.symbol] = position
-                self.cash -= (event.fill_cost + event.commission)
-            else: # SELL
-                if event.symbol in self.current_holdings:
-                    del self.current_holdings[event.symbol]
-                    self.cash += (event.fill_cost - event.commission)
+        """精确创建或销毁 BacktestPosition 对象"""
+        if event.type != 'FILL': return
+
+        if event.direction == 'BUY':
+            # --- 【核心修改】创建持仓对象 ---
+            position = BacktestPosition(
+                symbol=event.symbol,
+                quantity=event.quantity,
+                entry_timestamp=event.datetime, # 成交时间就是建仓时间
+                initial_price=event.initial_price,
+                avg_cost=event.avg_cost, # 首次买入，成交价就是均价
+                initial_risk_per_share=event.initial_risk,
+                entry_strategy_name=event.entry_strategy_name,
+                stop_loss_price=getattr(event, 'stop_loss_price', 0.0)
+            )
+            self.current_holdings[event.symbol] = position
+            self.cash -= (event.fill_cost + event.commission)
+        else: # SELL
+            if event.symbol in self.current_holdings:
+                del self.current_holdings[event.symbol]
+                self.cash += (event.fill_cost - event.commission)
 
 
     # --- 一个关键的辅助方法 ---
     def get_held_symbols(self) -> list:
         """返回当前持有仓位的股票列表。"""
-        return [symbol for symbol, quantity in self.current_holdings.items() if isinstance(quantity, (int, float)) and quantity > 0]
+        # 现在它直接返回字典的键，因为字典里只有持仓股
+        return list(self.current_holdings.keys())
+        # return [symbol for symbol, quantity in self.current_holdings.items() if isinstance(quantity, (int, float)) and quantity > 0]
 
     # --- 获取持仓详细信息的接口 ---
     def get_position(self, symbol: str) -> BacktestPosition | None:

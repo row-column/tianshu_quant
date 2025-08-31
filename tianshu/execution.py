@@ -51,6 +51,8 @@ class SimulatedExecutionHandler(ExecutionHandler):
                     avg_cost=fill_price,
                     # 作为忠实的“传话筒”，把风险信息原封不动地抄送
                     initial_risk=event.initial_risk,
+                    entry_strategy_name=getattr(event, 'entry_strategy_name', 'Unknown'),
+                    stop_loss_price=getattr(event, 'stop_loss_price', 0.0),
                     commission=commission
                 )
                 events.put(fill_event)

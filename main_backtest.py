@@ -7,7 +7,16 @@ from tianshu.execution import SimulatedExecutionHandler
 from tianshu.portfolio import Portfolio
 from tianshu.tianshu_strategies import (
     PraetorianStrategyForBacktest,
-    TrendFollowerSellStrategyForBacktest
+    MacdReversalStrategyForBacktest,
+    MacdReversalStrategyProForBacktest,
+    MomentumContinuationStrategyForBacktest,
+    PredatorAmbushStrategyForBacktest,
+    TrendFollowerSellStrategyForBacktest,
+    MacdReversalSellStrategyForBacktest,
+    FixedStopLossStrategyForBacktest,
+    ApexPredatorExitStrategyForBacktest,
+    NextDaySellStrategyProForBacktest,
+    IntradayHighStallATRForBacktest
 )
 import warnings
 warnings.filterwarnings("ignore")
@@ -25,6 +34,7 @@ symbol_list = [
     '00981.HK', '03750.HK', 'AMDL.US', 'WMT.US',
     '01024.HK', '06060.HK', 'AMZU.US'
 ]
+# symbol_list = ['0005.HK', '9988.HK',"00981.HK","01810.HK","07226.HK"]
 
 initial_capital = 100000.0
 
@@ -52,9 +62,42 @@ strategies_to_run = [
         'params': praetorian_params
     },
     {
-        'class': TrendFollowerSellStrategyForBacktest,
-        'params': sell_strategy_params
-    }
+        'class': MacdReversalStrategyForBacktest,
+        # 'params': {'k_period_minutes':60}
+    },
+    # {
+    #     'class': MacdReversalStrategyProForBacktest,
+    # },
+    # {
+    #     'class': MomentumContinuationStrategyForBacktest,
+    # },
+    {
+        'class': PredatorAmbushStrategyForBacktest,
+    },
+    {
+        'class': MacdReversalSellStrategyForBacktest,
+    },
+    {
+        'class': FixedStopLossStrategyForBacktest,
+    },
+    {
+        'class': ApexPredatorExitStrategyForBacktest,
+    },
+    # {
+    #     'class': NextDaySellStrategyProForBacktest,
+    # },
+
+    # {
+    #     'class': IntradayHighStallATRForBacktest,
+    #     'params':  {
+    #         'upper_shadow_ratio': 1.5,
+    #         'retrace_atr_multiplier': 1.8,
+    #     }
+    # },
+    # {
+    #     'class': TrendFollowerSellStrategyForBacktest,
+    #     'params': sell_strategy_params
+    # }
 ]
 
 # --- 启动回测 ---

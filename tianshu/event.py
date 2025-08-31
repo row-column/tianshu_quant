@@ -25,18 +25,19 @@ class SignalEvent(Event):
 
 class OrderEvent(Event):
     """当Portfolio对象希望下单时触发。"""
-    def __init__(self, symbol, order_type, quantity, direction, initial_risk=0.0):
+    def __init__(self, symbol, order_type, quantity, direction, initial_risk=0.0,entry_strategy_name="", stop_loss_price=0.0):
         self.type = 'ORDER'
         self.symbol = symbol
         self.order_type = order_type # 'MKT'
         self.quantity = quantity
         self.direction = direction # 'BUY' 或 'SELL'
-        # --- 【核心新增】附带上本次交易的单位风险 ---
         self.initial_risk = initial_risk
+        self.entry_strategy_name = entry_strategy_name
+        self.stop_loss_price = stop_loss_price
 
 class FillEvent(Event):
     """封装订单成交的细节。"""
-    def __init__(self, datetime, symbol, exchange, quantity, direction, fill_cost,initial_price,avg_cost,initial_risk, commission=0.0):
+    def __init__(self, datetime, symbol, exchange, quantity, direction, fill_cost,initial_price,avg_cost,initial_risk,entry_strategy_name,stop_loss_price,commission=0.0):
         self.type = 'FILL'
         self.datetime = datetime
         self.symbol = symbol
@@ -47,6 +48,8 @@ class FillEvent(Event):
         self.initial_price = initial_price
         self.avg_cost = avg_cost
         self.initial_risk = initial_risk
+        self.entry_strategy_name = entry_strategy_name
+        self.stop_loss_price = stop_loss_price
         self.commission = commission
 
 events = Queue()
