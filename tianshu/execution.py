@@ -1,4 +1,6 @@
-# tianshu/execution.py
+import os, sys
+project_path = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.append(project_path)
 from abc import ABC, abstractmethod
 from .event import FillEvent, events
 

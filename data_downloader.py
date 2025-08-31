@@ -1,7 +1,8 @@
-import os
+import os, sys
+project_path = os.path.dirname(os.path.abspath(__file__))
+sys.path.append(project_path)
 import time
 from datetime import datetime, timedelta
-
 from longport.openapi import Config, QuoteContext, Period, AdjustType
 from utils.longport_api_utils import get_history_klines_data
 from config.settings import LONGPORT_APP_KEY, LONGPORT_APP_SECRET, LONGPORT_ACCESS_TOKEN, DATA_PATH
@@ -10,12 +11,12 @@ from config.settings import LONGPORT_APP_KEY, LONGPORT_APP_SECRET, LONGPORT_ACCE
 # 定义你要回测的股票池
 SYMBOLS_TO_DOWNLOAD = [
     "AAPL.US", "TSLA.US", "NVDA.US", # 美股
-    "0700.HK", "9988.HK", "0005.HK"  # 港股
+    "00700.HK", "09988.HK", "00005.HK","01810.HK","07226.HK","00981.HK"  # 港股
 ]
 
 # 定义要下载的数据周期和时间范围
 KLINE_PERIOD = Period.Day  # 我们以日线为例
-DAYS_TO_DOWNLOAD = 365 * 1 # 下载过去5年的数据
+DAYS_TO_DOWNLOAD = 365 * 2 # 下载过去5年的数据
 
 # --- 主逻辑 ---
 def download_data():
