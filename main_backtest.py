@@ -16,6 +16,7 @@ from tianshu.tianshu_strategies import (
     FixedStopLossStrategyForBacktest,
     ApexPredatorExitStrategyForBacktest,
     NextDaySellStrategyProForBacktest,
+    NarrativeWBottomStrategyForBacktest,
     IntradayHighStallATRForBacktest
 )
 import warnings
@@ -36,6 +37,37 @@ symbol_list = [
 ]
 # symbol_list = ['0005.HK', '9988.HK',"00981.HK","01810.HK","07226.HK"]
 
+SYMBOLS_TO_DOWNLOAD_HK = [
+    '00002.HK', '01347.HK', '07200.HK', '00005.HK', '01357.HK', '07226.HK',
+    '00016.HK', '01398.HK', '09868.HK', '0005.HK', '01810.HK', '09988.HK',
+    '00165.HK', '02359.HK', '09992.HK', '00268.HK', '02800.HK', '9988.HK',
+    '00388.HK', '02899.HK', '00981.HK', '03750.HK', '01024.HK', '06060.HK',
+    '6690.HK', '2809.HK', '6618.HK', '2357.HK', '2382.HK', '968.HK',
+    '1816.HK', '2015.HK', '1211.HK', '1276.HK', '883.HK', '6160.HK',
+    '9880.HK', '1772.HK', '1797.HK', '2228.HK', '3690.HK', '9660.HK',
+    '9618.HK', '81299.HK', '2845.HK', '2806.HK', '2828.HK'
+]
+
+SYMBOLS_TO_DOWNLOAD_US = [
+    'JNJ.US', 'JPM.US', 'LLYX.US', 'MSFU.US', 'PLTU.US', 'SOXL.US', 'AAPU.US',
+    'TSLL.US', 'AMDL.US', 'WMT.US', 'AMZU.US', 'SNOU.US', 'SNOW.US',
+    'RERE.US', 'AFRM.US', 'UMAC.US', 'HIMS.US', 'NFLU.US', 'RXRX.US',
+    'NNE.US', 'CRMG.US', 'KPDD.US', 'PDD.US', 'TEM.US', 'LULU.US', 'IWM.US',
+    'OPEN.US', 'PHM.US', 'LEN.US', 'DHI.US', 'APPX.US', 'FUTU.US', 'BULL.US',
+    'KO.US', 'TMDX.US', 'LFMD.US', 'DXYZ.US', 'SPCE.US', 'LUNR.US',
+    'SOLZ.US', 'ETHA.US', 'OUST.US', 'AEVA.US', 'HSAI.US', 'PONY.US',
+    'RIVN.US', 'ACHR.US', 'SEZL.US', 'SHLS.US', 'NXT.US', 'ARRY.US', 'RUN.US',
+    'FSLR.US', 'EVGO.US', 'EOSE.US', 'MVST.US', 'LEU.US', 'SMR.US',
+    'OKTA.US', 'CRWL.US', 'CRWD.US', 'RBRK.US', 'SOUN.US', 'NBIS.US',
+    'QMCO.US', 'IONQ.US', 'QBTS.US', 'QUBT.US', 'RGTI.US', 'UNHG.US',
+    'UNH.US', 'BLSH.US', 'CVX.US', 'XOM.US', 'BMNR.US', 'TLRY.US', 'VALN.US',
+    'SE.US', 'TEMT.US', 'TME.US', 'ASTS.US', 'MP.US', 'RKLB.US', 'CRCL.US',
+    'GE.US', 'RTX.US', 'CRWV.US', 'MVLL.US', 'CONL.US', 'TQQQ.US', 'ASMG.US',
+    'ALAB.US', 'RDTL.US', 'SPXL.US', 'DIG.US', 'ERX.US', 'XLV.US', 'SMH.US',
+    'SPYU.US', 'UDOW.US', 'TNA.US', 'UPRO.US', 'AVGX.US'
+]
+symbol_list = SYMBOLS_TO_DOWNLOAD_HK + SYMBOLS_TO_DOWNLOAD_US
+# symbol_list = ['0005.HK', '9988.HK',"00981.HK","01810.HK","07226.HK"]
 initial_capital = 100000.0
 
 # --- 【核心修改】创建策略的“图纸和原材料”清单 ---
@@ -63,8 +95,22 @@ strategies_to_run = [
     },
     {
         'class': MacdReversalStrategyForBacktest,
-        # 'params': {'k_period_minutes':60}
+        'params': {'k_period_minutes':60}
     },
+    # {
+    #     'class': NarrativeWBottomStrategyForBacktest,
+    #     'params': {
+    #         'k_period_minutes':240,
+    #         'ookback_period':150,
+    #         'capitulation_vol_ratio':2.0,
+    #         'volume_contraction_ratio':0.5,
+    #         'higher_low_tolerance':1.005,
+    #         'breakout_vol_ratio':1.8
+    #         }
+    # },
+    # {
+    #     'class': NarrativeWBottomStrategyForBacktest,
+    # },
     # {
     #     'class': MacdReversalStrategyProForBacktest,
     # },

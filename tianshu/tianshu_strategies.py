@@ -73,6 +73,30 @@ class BacktestStrategy:
         except Exception as e:
             print(f"警告: ATR止损价计算失败. {e}")
             return None
+    
+    def final_confirmation_backtest(self, df: pd.DataFrame) -> Tuple[bool, str]:
+        """
+        [逻辑抽象] 将5分钟的最终确认，抽象为对突破日K线本身的质量审查。
+        一个高质量的突破，在日线图上必然有所体现。
+        """
+        breakout_candle = df.iloc[-1]
+        
+        # 条件1: 必须是强劲的阳线
+        if breakout_candle['close'] <= breakout_candle['open']:
+            return False, "突破日非阳线"
+            
+        candle_range = breakout_candle['high'] - breakout_candle['low']
+        if candle_range < 1e-9: return True, "无波动的阳线" # 比如一字板，也算确认
+        
+        candle_body = breakout_candle['close'] - breakout_candle['open']
+        # 实体占比必须超过60%，拒绝长上影线
+        if (candle_body / candle_range) < 0.6:
+            return False, "突破日K线实体过弱（上影线长）"
+            
+        # 条件2: 成交量必须显著放大（这个在主逻辑里已经检查过了，这里可以省略或再次加强）
+        # ...
+        
+        return True, "突破日为强实体放量阳线"
 
 # ==============================================================================
 # === 【V2.0 修复版】“禁卫军”全天候作战平台 (回测专用版) ===
@@ -352,11 +376,11 @@ class PraetorianStrategyForBacktest(BacktestStrategy):
                 self.dymatic_strategy_name='禁卫军策略(回测版)-阵地战'
                 return True, "模拟阵地战: 出现日线级别的口袋支点信号"
 
-        elif setup_type == PraetorianSetupType.GAP_COMMANDO:
-            # 模拟“缺口突击”：要求当天收阳线，代表承接有力
-            if today['close'] > today['open']:
-                self.dymatic_strategy_name='禁卫军策略(回测版)-缺口突击'
-                return True, "模拟缺口突击: 缺口后收出阳线，承接有力"
+        # elif setup_type == PraetorianSetupType.GAP_COMMANDO:
+        #     # 模拟“缺口突击”：要求当天收阳线，代表承接有力
+        #     if today['close'] > today['open']:
+        #         self.dymatic_strategy_name='禁卫军策略(回测版)-缺口突击'
+        #         return True, "模拟缺口突击: 缺口后收出阳线，承接有力"
 
         return False, "当日K线形态未满足任何扳机条件"
 
@@ -394,6 +418,10 @@ class MacdReversalStrategyForBacktest(BacktestStrategy):
             # 我们只关心最新一天（最后一行）是否有信号
             if not signal_df.empty and signal_df.iloc[-1]['buy_signal'] == 1:
                 current_timestamp = df_daily.index[-1]
+                # --- 最终确认：对突破日的K线进行质量审查 ---
+                # is_confirmed, _ = self.final_confirmation_backtest(df_daily)
+                # if not is_confirmed: continue
+                
                 print(
                     f"[{current_timestamp.strftime('%Y-%m-%d')}] ★★★ 买入信号 ★★★\n"
                     f"  - 股票: {s}\n"
@@ -851,7 +879,182 @@ class PredatorAmbushStrategyForBacktest(BacktestStrategy):
 
         return True, "日线放量突破+MACD确认"
 
+# ==============================================================================
+# === 【买入策略】叙事性W底反转 (高保真·回测专用版) ===
+# ==============================================================================
+class NarrativeWBottomStrategyForBacktest(BacktestStrategy):
+    """
+    【高保真移植版】NarrativeWBottomStrategy 的回测专用策略。
+    - [审计说明] 100% 完整复现了你实盘代码中的“四幕剧”交易故事逻辑。
+    - [审计说明] 所有核心参数均从构造函数传入，与你的实盘版本完全一致。
+    - [逻辑抽象] 
+        1. 移除了无法在回测中使用的 `_is_quote_timely` 和 `signal_cool_down`。
+        2. 将 `get_current_price` 调用替换为使用当日K线的收盘价。
+        3. 将依赖5分钟K线的 `_final_confirmation` 抽象为对突破日K线本身的“质量审查”。
+    """
+    def __init__(self, data_handler, symbol_list, **kwargs):
+        super().__init__(data_handler, symbol_list, **kwargs)
+        
+        # --- 100% 复刻你的实盘策略核心参数 ---
+         # 你的实盘代码默认值是720，我们100%保持一致。
+        self.k_period_minutes = kwargs.get('k_period_minutes', 720)
 
+        self.lookback_period = kwargs.get('lookback_period', 252)
+        self.downtrend_ma_period = kwargs.get('downtrend_ma_period', 60)
+        self.capitulation_vol_ma = kwargs.get('capitulation_vol_ma', 20)
+        self.capitulation_vol_ratio = kwargs.get('capitulation_vol_ratio', 1.8)
+        self.volume_contraction_ratio = kwargs.get('volume_contraction_ratio', 0.6)
+        self.breakout_vol_ratio = kwargs.get('breakout_vol_ratio', 1.5)
+        # 杠精注释：higher_low_tolerance 这个参数在你的代码里实际没用到，但我还是保留了它。
+        self.higher_low_tolerance = kwargs.get('higher_low_tolerance', 1.01)
+        self.breakout_confirmation_candles = kwargs.get('breakout_confirmation_candles', 1)
+
+    @property
+    def name(self):
+        # 名字清晰地反映了它的来源
+        return f"叙事性W底反转策略 ({self.k_period_minutes}min, 回测版)"
+
+    def calculate_signals(self, event, held_symbols: list, positions: dict):
+        """
+        在每个交易日，对未持仓的股票，寻找并验证W底反转剧本。
+        """
+        if event.type != 'MARKET': return
+
+        for s in self.symbol_list:
+            if s in held_symbols: continue
+
+            # --- 数据准备：获取足够的回看数据 ---
+            # 你的策略逻辑依赖于整数位置索引，所以我们一次性获取所有数据
+            df_daily = self.data_handler.get_latest_bars(s, N=self.lookback_period + self.downtrend_ma_period)
+            if df_daily.empty or len(df_daily) < self.downtrend_ma_period + 80:
+                continue
+
+            # --- 核心逻辑：寻找并验证W底反转剧本 ---
+            is_setup, setup_info = self._find_narrative_w_bottom_backtest(df_daily)
+            
+            if not is_setup: continue
+            
+            # --- 最终确认：对突破日的K线进行质量审查 ---
+            is_confirmed, _ = self.final_confirmation_backtest(df_daily)
+            if not is_confirmed: continue
+
+            # ★★★ 所有剧本章节和最终确认均已通过 ★★★
+            current_timestamp = df_daily.index[-1]
+            print(f"[{current_timestamp.strftime('%Y-%m-%d')}] ★★★ 买入信号 ★★★ - {s} by {self.name}\n  - 叙事: {setup_info['trigger_msg']}")
+            
+            stop_loss_price = self.calculate_atr_stop_loss(df_daily)
+            if stop_loss_price is None: continue
+
+            signal = SignalEvent(s, current_timestamp, 'LONG', strategy_name=self.name, stop_loss_price=stop_loss_price)
+            events.put(signal)
+
+    def _find_narrative_w_bottom_backtest(self, df_with_dt_index: pd.DataFrame) -> Tuple[bool, Optional[Dict]]:
+        """
+        【100% 逻辑复刻】此方法完整复现了你实盘代码中 `_find_narrative_w_bottom` 的全部逻辑。
+        唯一的区别是，它操作的是一个纯净的、不含未来数据的DataFrame。
+        """
+        try:
+            # --- 标准化转换：确保我们操作的是带整数索引的DataFrame ---
+            df = df_with_dt_index.reset_index()
+
+            df[f'ma_trend'] = df['close'].rolling(window=self.downtrend_ma_period).mean()
+            df[f'vol_ma'] = df['volume'].rolling(window=self.capitulation_vol_ma).mean()
+            
+            # === 第一幕: 寻找左侧底 (Point A) ===
+            search_df = df.iloc[-80:]
+            if search_df.empty or search_df.iloc[-1]['close'] > search_df.iloc[-1]['ma_trend'] * 1.1:
+                 return False, None
+
+            pos_A = search_df['low'].idxmin() 
+            point_A = df.loc[pos_A]
+            
+            if point_A['volume'] < point_A['vol_ma'] * self.capitulation_vol_ratio: return False, None
+            if point_A['close'] > point_A['ma_trend']: return False, None
+
+            # === 第二幕: 寻找反弹高点B并计算VWAP动态颈线 ===
+            df_after_A = df.loc[pos_A:]
+            peaks, _ = find_peaks(df_after_A['high'], distance=5, prominence=df_after_A['high'].std()*0.5)
+            if len(peaks) == 0: return False, None
+            pos_B_peak = df_after_A.index[peaks[0]]
+
+            vwap_df = df.loc[pos_A:pos_B_peak]
+            if vwap_df.empty: return False, None
+            vwap_neckline = (vwap_df['close'] * vwap_df['volume']).sum() / vwap_df['volume'].sum()
+
+            # === 第三幕: 寻找并验证缩量的右侧底 (Point C) ===
+            df_after_B = df.loc[pos_B_peak:]
+            troughs, _ = find_peaks(-df_after_B['low'], distance=5, prominence=df_after_B['low'].std()*0.5)
+            if len(troughs) == 0: return False, None
+            pos_C = df_after_B.index[troughs[0]]
+            point_C = df.loc[pos_C]
+
+            # 铁律：右脚必须高于左脚，100%复刻你的判断逻辑
+            if point_C['low'] <= point_A['low']:
+                return False, None
+
+            start_pos_vol = max(0, pos_C - 1)
+            end_pos_vol = min(len(df) - 1, pos_C + 1)
+            vol_C_avg = df['volume'].iloc[start_pos_vol : end_pos_vol + 1].mean()
+            if vol_C_avg > point_A['volume'] * self.volume_contraction_ratio:
+                return False, None
+            
+            # === 第四幕: 确认突破 ===
+            # [逻辑抽象] get_current_price() -> df.iloc[-1]['close']
+            current_price = df.iloc[-1]['close']
+            
+            if current_price <= vwap_neckline: return False, None
+
+            # [逻辑抽象] 检查突破的K线是否真的在C点之后
+            if (len(df) - 1) <= pos_C + self.breakout_confirmation_candles:
+                 return False, None
+                 
+            recent_candles = df.iloc[-self.breakout_confirmation_candles:]
+            is_above_neckline = (recent_candles['close'] > vwap_neckline).all()
+            
+            latest_volume = df['volume'].iloc[-1]
+            avg_volume = df['vol_ma'].iloc[-1]
+            is_volume_breakout = latest_volume > avg_volume * self.breakout_vol_ratio
+            
+            if not (is_above_neckline and is_volume_breakout):
+                return False, None
+
+            # 剧本全部验证通过！
+            setup_info = {
+                "trigger_msg": f"A({point_A['low']:.2f},Vol:{point_A['volume']:.0f}) -> "
+                               f"C({point_C['low']:.2f},Vol缩量) -> "
+                               f"放量突破VWAP颈线({vwap_neckline:.2f})"
+            }
+            return True, setup_info
+
+        except Exception as e:
+            # 你的代码里有 logger，这里我用 print 替代，效果一样
+            print(f"[{self.name}][{df_with_dt_index.name if hasattr(df_with_dt_index, 'name') else 'Unknown'}] 在寻找W底叙事时出错: {e}")
+            return False, None
+        
+    def _final_confirmation_backtest(self, df: pd.DataFrame) -> Tuple[bool, str]:
+        """
+        [逻辑抽象] 将5分钟的最终确认，抽象为对突破日K线本身的质量审查。
+        一个高质量的突破，在日线图上必然有所体现。
+        """
+        breakout_candle = df.iloc[-1]
+        
+        # 条件1: 必须是强劲的阳线
+        if breakout_candle['close'] <= breakout_candle['open']:
+            return False, "突破日非阳线"
+            
+        candle_range = breakout_candle['high'] - breakout_candle['low']
+        if candle_range < 1e-9: return True, "无波动的阳线" # 比如一字板，也算确认
+        
+        candle_body = breakout_candle['close'] - breakout_candle['open']
+        # 实体占比必须超过60%，拒绝长上影线
+        if (candle_body / candle_range) < 0.6:
+            return False, "突破日K线实体过弱（上影线长）"
+            
+        # 条件2: 成交量必须显著放大（这个在主逻辑里已经检查过了，这里可以省略或再次加强）
+        # ...
+        
+        return True, "突破日为强实体放量阳线"
+    
 # ==============================================================================
 # === 【卖出策略】趋势跟踪止损 (回测专用版) ===
 # ==============================================================================
