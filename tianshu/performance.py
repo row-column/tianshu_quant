@@ -16,27 +16,68 @@ def create_drawdowns(equity_curve):
     drawdown = (hwm - equity_curve) / hwm
     return drawdown.max()
 
-def show_performance_stats(equity_curve, initial_capital):
-    """展示回测的性能统计和图表。"""
-    print("\n--- 天枢Quant回测性能报告 ---")
+# def show_performance_stats(equity_curve, initial_capital,is_show:bool=False):
+#     """展示回测的性能统计和图表。"""
+#     print("\n--- 天枢Quant回测性能报告 ---")
+    
+#     total_return = (equity_curve['total'].iloc[-1] / initial_capital - 1.0)
+#     print(f"初始资本: ${initial_capital:,.2f}")
+#     print(f"最终总资产: ${equity_curve['total'].iloc[-1]:,.2f}")
+#     print(f"总回报率: {total_return:.2%}")
+    
+#     returns = equity_curve['returns'].dropna()
+#     sharpe = create_sharpe_ratio(returns)
+#     max_dd = create_drawdowns(equity_curve['total'])
+    
+#     print(f"夏普比率 (年化): {sharpe:.2f}")
+#     print(f"最大回撤: {max_dd:.2%}")
+    
+#     if is_show:
+#         # 绘制净值曲线
+#         fig, ax = plt.subplots(figsize=(12, 8))
+#         ax.plot(equity_curve.index, equity_curve['total'].values)
+#         ax.set_title('Portfolio Equity Curve')
+#         ax.set_xlabel('Date')
+#         ax.set_ylabel('Total Value ($)')
+#         plt.grid(True)
+#         plt.show()
+
+def show_performance_stats(equity_curve, initial_capital, is_show:bool=False, output_file=None):
+    """
+    展示回测的性能统计和图表。
+    如果提供了 output_file (文件句柄)，则将报告写入文件，否则打印到控制台。
+    """
+    
+    # --- 杠精注释：把所有要输出的内容先准备好，而不是直接 print，这才是专业做法 ---
+    report_lines = []
+    report_lines.append("\n--- 天枢Quant回测性能报告 ---")
     
     total_return = (equity_curve['total'].iloc[-1] / initial_capital - 1.0)
-    print(f"初始资本: ${initial_capital:,.2f}")
-    print(f"最终总资产: ${equity_curve['total'].iloc[-1]:,.2f}")
-    print(f"总回报率: {total_return:.2%}")
+    report_lines.append(f"初始资本: ${initial_capital:,.2f}")
+    report_lines.append(f"最终总资产: ${equity_curve['total'].iloc[-1]:,.2f}")
+    report_lines.append(f"总回报率: {total_return:.2%}")
     
     returns = equity_curve['returns'].dropna()
     sharpe = create_sharpe_ratio(returns)
     max_dd = create_drawdowns(equity_curve['total'])
     
-    print(f"夏普比率 (年化): {sharpe:.2f}")
-    print(f"最大回撤: {max_dd:.2%}")
+    report_lines.append(f"夏普比率 (年化): {sharpe:.2f}")
+    report_lines.append(f"最大回撤: {max_dd:.2%}")
+
+    # --- 统一输出逻辑 ---
+    if output_file:
+        for line in report_lines:
+            output_file.write(line + "\n")
+    else:
+        for line in report_lines:
+            print(line)
     
-    # 绘制净值曲线
-    fig, ax = plt.subplots(figsize=(12, 8))
-    ax.plot(equity_curve.index, equity_curve['total'].values)
-    ax.set_title('Portfolio Equity Curve')
-    ax.set_xlabel('Date')
-    ax.set_ylabel('Total Value ($)')
-    plt.grid(True)
-    plt.show()
+    if is_show:
+        # 绘制净值曲线
+        fig, ax = plt.subplots(figsize=(12, 8))
+        ax.plot(equity_curve.index, equity_curve['total'].values)
+        ax.set_title('Portfolio Equity Curve')
+        ax.set_xlabel('Date')
+        ax.set_ylabel('Total Value ($)')
+        plt.grid(True)
+        plt.show()

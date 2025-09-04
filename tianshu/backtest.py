@@ -79,6 +79,6 @@ class Backtest:
         
         print("回测结束。")
 
-    def simulate_trading(self):
+    def simulate_trading(self,is_show:bool=False,output_file=None):
         self._run_backtest()
-        show_performance_stats(self.portfolio.equity_curve, self.initial_capital)
+        show_performance_stats(self.portfolio.equity_curve, self.initial_capital,is_show=is_show,output_file=output_file)

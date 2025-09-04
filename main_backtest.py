@@ -23,28 +23,15 @@ import warnings
 warnings.filterwarnings("ignore")
 # --- 回测配置 ---
 # 确保这些股票的数据文件存在于 data/ 目录中
-# symbol_list = ['0005.HK', '9988.HK',"00981.HK","01810.HK","07226.HK"]
-symbol_list = [
-    '00002.HK', '01347.HK', '07200.HK', 'JNJ.US',
-    '00005.HK', '01357.HK', '07226.HK', 'JPM.US',
-    '00016.HK', '01398.HK', '09868.HK', 'LLYX.US',
-    '0005.HK', '01810.HK', '09988.HK', 'MSFU.US',
-    '00165.HK', '02359.HK', '09992.HK', 'PLTU.US',
-    '00268.HK', '02800.HK', '9988.HK', 'SOXL.US',
-    '00388.HK', '02899.HK', 'AAPU.US', 'TSLL.US',
-    '00981.HK', '03750.HK', 'AMDL.US', 'WMT.US',
-    '01024.HK', '06060.HK', 'AMZU.US'
-]
-# symbol_list = ['0005.HK', '9988.HK',"00981.HK","01810.HK","07226.HK"]
 
 SYMBOLS_TO_DOWNLOAD_HK = [
-    '00002.HK', '01347.HK', '07200.HK', '00005.HK', '01357.HK', '07226.HK',
-    '00016.HK', '01398.HK', '09868.HK', '0005.HK', '01810.HK', '09988.HK',
-    '00165.HK', '02359.HK', '09992.HK', '00268.HK', '02800.HK', '9988.HK',
-    '00388.HK', '02899.HK', '00981.HK', '03750.HK', '01024.HK', '06060.HK',
-    '6690.HK', '2809.HK', '6618.HK', '2357.HK', '2382.HK', '968.HK',
-    '1816.HK', '2015.HK', '1211.HK', '1276.HK', '883.HK', '6160.HK',
-    '9880.HK', '1772.HK', '1797.HK', '2228.HK', '3690.HK', '9660.HK',
+    '01347.HK', '07200.HK',  '01357.HK', '07226.HK',
+    '01398.HK', '0005.HK', '01810.HK', '09988.HK',
+    '02359.HK', '09992.HK', '00268.HK', '02800.HK',
+    '00388.HK', '02899.HK', '00981.HK', '03750.HK', 
+    '01024.HK', '06060.HK','6690.HK', '2809.HK', '6618.HK',
+    '2015.HK', '1211.HK', '1276.HK', '883.HK', '6160.HK','1772.HK', 
+    '1797.HK', '2228.HK', '9660.HK',
     '9618.HK', '81299.HK', '2845.HK', '2806.HK', '2828.HK'
 ]
 
@@ -56,18 +43,30 @@ SYMBOLS_TO_DOWNLOAD_US = [
     'OPEN.US', 'PHM.US', 'LEN.US', 'DHI.US', 'APPX.US', 'FUTU.US', 'BULL.US',
     'KO.US', 'TMDX.US', 'LFMD.US', 'DXYZ.US', 'SPCE.US', 'LUNR.US',
     'SOLZ.US', 'ETHA.US', 'OUST.US', 'AEVA.US', 'HSAI.US', 'PONY.US',
-    'RIVN.US', 'ACHR.US', 'SEZL.US', 'SHLS.US', 'NXT.US', 'ARRY.US', 'RUN.US',
-    'FSLR.US', 'EVGO.US', 'EOSE.US', 'MVST.US', 'LEU.US', 'SMR.US',
-    'OKTA.US', 'CRWL.US', 'CRWD.US', 'RBRK.US', 'SOUN.US', 'NBIS.US',
+    'RIVN.US', 'ACHR.US', 'SEZL.US', 'NXT.US',
+    'EVGO.US', 'EOSE.US', 'MVST.US', 'LEU.US', 'SMR.US',
+    'OKTA.US', 'CRWL.US', 'RBRK.US', 'SOUN.US', 'NBIS.US',
     'QMCO.US', 'IONQ.US', 'QBTS.US', 'QUBT.US', 'RGTI.US', 'UNHG.US',
-    'UNH.US', 'BLSH.US', 'CVX.US', 'XOM.US', 'BMNR.US', 'TLRY.US', 'VALN.US',
+    'UNH.US', 'BLSH.US', 'XOM.US', 'BMNR.US', 'TLRY.US', 'VALN.US',
     'SE.US', 'TEMT.US', 'TME.US', 'ASTS.US', 'MP.US', 'RKLB.US', 'CRCL.US',
     'GE.US', 'RTX.US', 'CRWV.US', 'MVLL.US', 'CONL.US', 'TQQQ.US', 'ASMG.US',
-    'ALAB.US', 'RDTL.US', 'SPXL.US', 'DIG.US', 'ERX.US', 'XLV.US', 'SMH.US',
-    'SPYU.US', 'UDOW.US', 'TNA.US', 'UPRO.US', 'AVGX.US'
+    'ALAB.US', 'RDTL.US', 'SPXL.US','XLV.US', 'SMH.US',
+    'UDOW.US', 'TNA.US', 'UPRO.US'
 ]
-symbol_list = SYMBOLS_TO_DOWNLOAD_HK + SYMBOLS_TO_DOWNLOAD_US
-# symbol_list = ['0005.HK', '9988.HK',"00981.HK","01810.HK","07226.HK"]
+SYMBOLS_TO_DOWNLOAD_CN = [
+    "688775.SH","688981.SH","002384.SZ","300308.SZ","688041.SH",
+    "300476.SZ","603019.SH","601012.SH","600536.SH","000975.SZ",
+    "300750.SZ","300347.SZ","600900.SH","601939.SH","300195.SZ",
+    "603799.SH","601288.SH","300748.SZ","002475.SZ","601138.SH",
+    "688668.SH","600183.SH","300548.SZ","300570.SZ","300394.SZ",
+    "002195.SZ","002837.SZ","002241.SZ","600549.SH","516780.SH",
+    "159770.SZ","515070.SH","159202.SZ","516100.SH","159381.SZ",
+    "515010.SH","515980.SH","600410.SH","159869.SZ","600930.SH"
+]
+# symbol_list = SYMBOLS_TO_DOWNLOAD_HK + SYMBOLS_TO_DOWNLOAD_US
+symbol_list = SYMBOLS_TO_DOWNLOAD_CN
+# symbol_list = ['01810.HK', '00981.HK',"02899.HK","1211.HK","RBRK.US",'TMDX.US','IONQ.US','RKLB.US']
+
 initial_capital = 100000.0
 
 # --- 【核心修改】创建策略的“图纸和原材料”清单 ---
@@ -117,9 +116,9 @@ strategies_to_run = [
     # {
     #     'class': MomentumContinuationStrategyForBacktest,
     # },
-    {
-        'class': PredatorAmbushStrategyForBacktest,
-    },
+    # {
+    #     'class': PredatorAmbushStrategyForBacktest,
+    # },
     {
         'class': MacdReversalSellStrategyForBacktest,
     },
@@ -148,13 +147,69 @@ strategies_to_run = [
 
 # --- 启动回测 ---
 if __name__ == "__main__":
-    backtest = Backtest(
-        symbol_list=symbol_list,
-        initial_capital=initial_capital,
-        data_handler_cls=HistoricDataHandler,
-        execution_handler_cls=SimulatedExecutionHandler,
-        portfolio_cls=Portfolio,
-        # 【核心修改】将“配置清单”交给回测引擎工厂
-        strategy_config_list=strategies_to_run
-    )
-    backtest.simulate_trading()
+
+    is_single_stock_test:bool = True
+
+    if not is_single_stock_test:
+        print("--- 开始对【整个投资组合】进行回测 ---")
+
+        backtest = Backtest(
+            symbol_list=symbol_list,
+            initial_capital=initial_capital,
+            data_handler_cls=HistoricDataHandler,
+            execution_handler_cls=SimulatedExecutionHandler,
+            portfolio_cls=Portfolio,
+            # 【核心修改】将“配置清单”交给回测引擎工厂
+            strategy_config_list=strategies_to_run
+        )
+        backtest.simulate_trading(is_show=True)
+        print("--- 组合回测结束 ---")
+    else:
+        # --- 【第二部分：新增功能】对每个股票进行独立回测，并写入文件 ---
+        print("\n\n--- 开始【单股票独立】回测分析 ---")
+        
+        # --- 【核心修改】 ---
+        # 1. 定义输出文件名和路径
+        output_filename = os.path.join(project_path, "logs", "single_stock_performance_report.txt")
+        
+        # 2. 提取目录路径
+        output_dir = os.path.dirname(output_filename)
+
+        # 3. 在写入前，确保目录存在。如果不存在，就创建它。
+        #    杠精注释：os.makedirs(..., exist_ok=True) 是幂等的，这意味着即使目录已经存在，它也不会报错。
+        #    这才是编写健壮代码的正确姿势！
+        os.makedirs(output_dir, exist_ok=True)
+
+        print(f"详细报告将写入文件: {output_filename}")
+
+        with open(output_filename, 'w', encoding='utf-8') as f:
+            # 杠精注释：这里我们遍历的是原始的、完整的 symbol_list
+            for symbol in symbol_list:
+                print(f"正在分析股票: {symbol}...")
+                
+                # 写入文件头
+                f.write(f"股票代码：{symbol}\n")
+                
+                # 为单只股票创建一个全新的、独立的回测实例
+                # 杠精注释：注意这里的 symbol_list=[symbol]，这确保了回测环境的纯净性
+                backtest_single = Backtest(
+                    symbol_list=[symbol],  # <-- 关键点在这里！
+                    initial_capital=initial_capital,
+                    data_handler_cls=HistoricDataHandler,
+                    execution_handler_cls=SimulatedExecutionHandler,
+                    portfolio_cls=Portfolio,
+                    strategy_config_list=strategies_to_run
+                )
+                
+                # 调用修改后的方法，把文件句柄传进去
+                backtest_single.simulate_trading(output_file=f)
+                
+                # 在文件中增加一个分隔符，让报告更美观
+                f.write("\n" + "="*80 + "\n\n")
+                # --- 【杠精的最终奥义】 ---
+                # 杠精注释：在完成单次循环的所有写入操作后，强制将文件缓冲区的内容写入磁盘。
+                # 这确保了即使程序在下一次循环中意外中断，已完成的结果也不会丢失。
+                # 这才是兼顾了性能与数据安全性的专业做法！
+                f.flush()
+
+        print(f"--- 单股票独立回测分析完成，请查看 {output_filename} ---")

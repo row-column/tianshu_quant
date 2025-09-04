@@ -128,6 +128,17 @@ class PraetorianStrategyForBacktest(BacktestStrategy):
         self.gap_min_pct = kwargs.get('gap_min_pct', 0.04)
         # --- [2] Trigger (扳机) 抽象逻辑参数 ---
         self.atr_multiplier_breakout = kwargs.get('atr_multiplier_breakout', 0.25)
+        # --- 伏击战所需参数 ---
+        self.atr_multiplier_support = kwargs.get('atr_multiplier_support', 0.5)
+        self.lower_shadow_min_ratio = kwargs.get('lower_shadow_min_ratio', 0.4) # 下影线最小占比
+
+        # 杠精注释: 这两个参数是V5动态调整的基础，我们100%复刻
+        self.atr_multiplier_support_default = kwargs.get('atr_multiplier_support_default', 0.5)
+        self.lower_shadow_ratio_min_default = kwargs.get('lower_shadow_ratio_min_default', 0.4)
+        # === [核心抽象] 微观结构确认参数 ===
+        # 要求收盘价必须收在当日振幅的后半段，数值越高代表要求越严苛
+        self.upper_shadow_close_ratio_min = kwargs.get('upper_shadow_close_ratio_min', 0.65)
+
         self.dymatic_strategy_name = '禁卫军策略(回测版)'
 
     @property
@@ -175,7 +186,7 @@ class PraetorianStrategyForBacktest(BacktestStrategy):
                 if setup_type == PraetorianSetupType.NONE:
                     continue
                 
-                is_triggered, trigger_info = self._find_precision_trigger_backtest_v1(s, setup_type, setup_data, df_daily)
+                is_triggered, trigger_info = self._find_precision_trigger_backtest(s, setup_type, setup_data, df_daily)
                 if not is_triggered:
                     continue
 
@@ -198,46 +209,6 @@ class PraetorianStrategyForBacktest(BacktestStrategy):
                 signal = SignalEvent(s, current_timestamp, 'LONG', strategy_name=self.name,stop_loss_price=stop_loss_price)
                 events.put(signal)
 
-    def calculate_signals_v1(self, event):
-        """
-        【修改】主逻辑现在会检查股票是否已持仓，只对未持仓的股票检查买入信号。
-        """
-        if event.type != 'MARKET':
-            return
-
-        # --- 【新增】从 Portfolio 获取当前持仓 ---
-        # 杠精注释：在真实系统中，这个信息应该由 Backtest 引擎传入，
-        # 但为了简化，我们这里假设可以直接访问（这是一个小小的架构妥协）。
-        # 在我们的最终版 backtest.py 中，这个信息将通过 event 或参数传递。
-        # 此处我们依赖于 Portfolio 的状态，这在我们的架构中是允许的。
-        
-        # 实际上，Portfolio的持仓状态是独立的，策略不应该直接知道。
-        # 策略只负责产生信号。Portfolio会根据信号和持仓状态决定是否下单。
-        # 所以我们不需要 `held_symbols`，只需要避免对同一支股票重复发送买入信号即可。
-        
-        for s in self.symbol_list:
-            df_daily = self.data_handler.get_latest_bars(s, N=252)
-            if df_daily.empty or len(df_daily) < self.long_term_ma_period + 20:
-                continue
-
-            setup_type, setup_data = self._find_high_quality_setup_backtest(s, df_daily)
-            if setup_type == PraetorianSetupType.NONE:
-                continue
-            
-            is_triggered, trigger_info = self._find_precision_trigger_backtest(s, setup_type, setup_data, df_daily)
-            if not is_triggered:
-                continue
-
-            current_timestamp = df_daily.index[-1]
-            print(
-                f"[{current_timestamp.strftime('%Y-%m-%d')}] ★★★ 买入信号 ★★★\n"
-                f"  - 股票: {s}\n"
-                f"  - 日线背景: {setup_type.value}\n"
-                f"  - 作战命令: {trigger_info}"
-            )
-            # 【关键】发送的是 'LONG' 信号
-            signal = SignalEvent(s, current_timestamp, 'LONG', strategy_name=self.name)
-            events.put(signal)
 
     def _find_high_quality_setup_backtest(self, symbol: str, df_daily: pd.DataFrame) -> Tuple[PraetorianSetupType, Optional[Dict]]:
         # 1. 检查“缺口突击”Setup
@@ -320,61 +291,19 @@ class PraetorianStrategyForBacktest(BacktestStrategy):
         today = df_daily.iloc[-1]
 
         if setup_type == PraetorianSetupType.APEX_PREDATOR_PULLBACK:
-            yesterday_high = setup_data['yesterday_high']
-            yesterday_atr = setup_data['yesterday_atr']
-            if yesterday_atr == 0: return False, "ATR为0" # 避免无效计算
             
-            # 模拟“闪电战”：当天强势突破昨日高点+ATR缓冲
-            breakout_level = yesterday_high + self.atr_multiplier_breakout * yesterday_atr
-            is_strong_breakout = today['close'] > breakout_level
-            
-            # 模拟“阵地战”：出现日线级别的口袋支点
-            past_10_days = df_daily.iloc[-11:-1]
-            down_day_volumes = past_10_days[past_10_days['close'] < past_10_days['open']]['volume']
-            max_down_volume = down_day_volumes.max() if not down_day_volumes.empty else 0
-            is_pocket_pivot = (today['close'] > today['open']) and (today['volume'] > max_down_volume)
-            
-            if is_strong_breakout or is_pocket_pivot:
-                reason = "闪电战(日线突破)" if is_strong_breakout else "阵地战(口袋支点)"
-                return True, reason
+            # --- 战术1: 闪电战 (模拟开盘突破) ---
+            is_triggered, msg = self._trigger_blitzkrieg_backtest(setup_data, df_daily)
+            if is_triggered: return True, msg
 
-        elif setup_type == PraetorianSetupType.GAP_COMMANDO:
-            # 模拟“缺口突击”：要求当天收阳线，代表承接有力
-            if today['close'] > today['open']:
-                return True, "缺口后收阳，确认承接"
-
-        return False, "当日K线未满足扳机条件"
-    
-    def _find_precision_trigger_backtest_v1(self, symbol: str, setup_type: PraetorianSetupType, setup_data: Dict, df_daily: pd.DataFrame) -> Tuple[bool, str]:
-        """
-        日线回测中的扳机抽象。我们用“当天收盘时的K线形态”来模拟盘中的决策。
-        """
-        today = df_daily.iloc[-1]
-
-        if setup_type == PraetorianSetupType.APEX_PREDATOR_PULLBACK:
-            yesterday_high = setup_data['yesterday_high']
-            yesterday_atr = setup_data['yesterday_atr']
-            if yesterday_atr == 0: return False, "ATR为0" # 避免无效计算
+            # --- 战术2: 阵地战 (模拟盘中口袋支点) ---
+            is_triggered, msg = self._trigger_trench_warfare_backtest(df_daily)
+            if is_triggered: return True, msg
             
-            # 模拟“闪电战”：当天强势突破昨日高点+ATR缓冲
-            breakout_level = yesterday_high + self.atr_multiplier_breakout * yesterday_atr
-            if today['high'] > breakout_level and today['close'] > breakout_level:
-                # --- 【关键修正】从df_daily.iloc[-2]获取avg_volume_20 ---
-                avg_vol_yesterday = df_daily.iloc[-2].get('avg_volume_20')
-                if avg_vol_yesterday and today['volume'] > avg_vol_yesterday * 1.5:
-                    self.dymatic_strategy_name='禁卫军策略(回测版)-闪电战'
-                    return True, f"模拟闪电战: 日线级别放量突破ATR增强位({breakout_level:.2f})"
-            
-            is_strong_bullish_candle = (today['close'] > today['open']) and \
-                                       ((today['high'] - today['close']) / (today['high'] - today['low'] + 1e-9) < 0.3)
-            
-            past_10_days = df_daily.iloc[-11:-1]
-            down_day_volumes = past_10_days[past_10_days['close'] < past_10_days['open']]['volume']
-            max_down_volume = down_day_volumes.max() if not down_day_volumes.empty else 0
-            
-            if is_strong_bullish_candle and today['volume'] > max_down_volume:
-                self.dymatic_strategy_name='禁卫军策略(回测版)-阵地战'
-                return True, "模拟阵地战: 出现日线级别的口袋支点信号"
+            # --- 战术3: 伏击战 (模拟尾盘探底回升) ---
+            # is_triggered, msg = self._trigger_ambush_backtest(setup_data, df_daily)
+            # is_triggered, msg = self._trigger_ambush_v5_backtest(df_daily)
+            # if is_triggered: return True, msg
 
         # elif setup_type == PraetorianSetupType.GAP_COMMANDO:
         #     # 模拟“缺口突击”：要求当天收阳线，代表承接有力
@@ -383,6 +312,142 @@ class PraetorianStrategyForBacktest(BacktestStrategy):
         #         return True, "模拟缺口突击: 缺口后收出阳线，承接有力"
 
         return False, "当日K线形态未满足任何扳机条件"
+    
+    def _trigger_blitzkrieg_backtest(self, setup_data: Dict, df_daily: pd.DataFrame) -> Tuple[bool, str]:
+        """[回测版扳机] 闪电战: 模拟日线级别的放量突破"""
+        today = df_daily.iloc[-1]
+        yesterday_high = setup_data['yesterday_high']
+        yesterday_atr = setup_data['yesterday_atr']
+        if yesterday_atr <= 0: return False, "ATR为0"
+        
+        breakout_level = yesterday_high + self.atr_multiplier_breakout * yesterday_atr
+        if today['high'] > breakout_level and today['close'] > breakout_level:
+            avg_vol_yesterday = df_daily.iloc[-2].get('avg_volume_20')
+            if avg_vol_yesterday and today['volume'] > avg_vol_yesterday * 1.5:
+                self.dymatic_strategy_name = '禁卫军策略(回测版)-闪电战'
+                return True, f"模拟闪电战: 日线级别放量突破ATR增强位({breakout_level:.2f})"
+        return False, ""
+
+    def _trigger_trench_warfare_backtest(self, df_daily: pd.DataFrame) -> Tuple[bool, str]:
+        """[回测版扳机] 阵地战: 模拟日线级别的口袋支点"""
+        today = df_daily.iloc[-1]
+        # 条件1: 必须是强势光头阳线 (上影线很短)
+        is_strong_bullish_candle = (today['close'] > today['open']) and \
+                                   ((today['high'] - today['close']) / (today['high'] - today['low'] + 1e-9) < 0.3)
+        
+        # 条件2: 成交量必须压制过去10天所有阴线的成交量
+        past_10_days = df_daily.iloc[-11:-1]
+        down_day_volumes = past_10_days[past_10_days['close'] < past_10_days['open']]['volume']
+        max_down_volume = down_day_volumes.max() if not down_day_volumes.empty else 0
+        
+        if is_strong_bullish_candle and today['volume'] > max_down_volume:
+            self.dymatic_strategy_name = '禁卫军策略(回测版)-阵地战'
+            return True, "模拟阵地战: 出现日线级别的口袋支点信号"
+        return False, ""
+    
+    def _trigger_ambush_backtest(self, setup_data: Dict, df_daily: pd.DataFrame) -> Tuple[bool, str]:
+        """
+        [回测版扳机] 伏击战: 模拟尾盘在关键支撑区出现的缩量长下影K线。
+        这是对实盘代码 _trigger_ambush_v1 逻辑的100%日线级别抽象。
+        """
+        today = df_daily.iloc[-1]
+        yesterday = df_daily.iloc[-2] # 所有基准数据来自昨天
+
+        # 1. 获取基准数据
+        ma10 = yesterday.get('ma10')
+        atr = yesterday.get('atr')
+        avg_volume_20 = yesterday.get('avg_volume_20')
+
+        if pd.isna(ma10) or pd.isna(atr) or pd.isna(avg_volume_20) or atr <= 0:
+            return False, "基准指标数据无效"
+
+        # 2. 定义动态支撑区 (基于昨日数据)
+        support_zone_low = ma10 - self.atr_multiplier_support * atr
+
+        # 3. 核心形态学判断 (基于今日K线)
+        # 规则A: 当日必须是缩量的
+        if today['volume'] > avg_volume_20 * self.volume_shrink_ratio:
+            return False, "非缩量"
+
+        # 规则B: 最低价必须刺穿过支撑区
+        if today['low'] >= support_zone_low:
+            return False, "未下探支撑区"
+
+        # 规则C: 收盘价必须成功收回支撑区之上
+        if today['close'] < support_zone_low:
+            return False, "未能收回支撑区"
+
+        # 规则D: 必须形成代表拒绝的长下影线
+        candle_range = today['high'] - today['low']
+        if candle_range < 1e-9: return False, "无波动" # 避免除零
+
+        lower_shadow = min(today['open'], today['close']) - today['low']
+        if (lower_shadow / candle_range) < self.lower_shadow_min_ratio:
+            return False, "下影线力度不足"
+        
+        # 所有条件满足
+        self.dymatic_strategy_name = '禁卫军策略(回测版)-伏击战'
+        return True, f"模拟伏击战: 日线形成缩量长下影，收回动态支撑区({support_zone_low:.2f})之上"
+    
+    def _trigger_ambush_v5_backtest(self, df_daily: pd.DataFrame) -> Tuple[bool, str]:
+        """
+        [高保真回测扳机] 伏击战V5
+        """
+        today = df_daily.iloc[-1]
+        yesterday = df_daily.iloc[-2]
+
+        # --- [1] 天时：宏观环境审查 (此处简化，未来可扩展) ---
+        # 杠精注释: 专业的系统会在这里接入大盘择时模块，此处我们假设宏观环境OK。
+
+        # --- [2] 地利：动态参数调整 (100%复现实盘逻辑) ---
+        recent_atr = df_daily['atr'].iloc[-6:-1].mean() # 最近5天ATR
+        historical_avg_atr = df_daily['atr'].iloc[-61:-6].mean() # 历史60天ATR
+        
+        if pd.isna(recent_atr) or pd.isna(historical_avg_atr) or historical_avg_atr == 0:
+            return False, "ATR数据不足，无法动态调整参数"
+
+        # 根据近期波动率，动态生成伏击参数
+        if recent_atr > historical_avg_atr * 1.5:
+            # 市场波动加剧，放宽伏击条件
+            atr_multiplier = self.atr_multiplier_support_default * 1.5 # 允许更深回调
+            lower_shadow_ratio_min = self.lower_shadow_ratio_min_default * 0.85 # 下影线要求降低
+        else:
+            # 市场波动正常，使用标准参数
+            atr_multiplier = self.atr_multiplier_support_default
+            lower_shadow_ratio_min = self.lower_shadow_ratio_min_default
+
+        # --- [3] 形态学判断 (基于动态参数) ---
+        ma10 = yesterday.get('ma10')
+        atr = yesterday.get('atr')
+        avg_volume_20 = yesterday.get('avg_volume_20')
+
+        if pd.isna(ma10) or pd.isna(atr) or pd.isna(avg_volume_20) or atr <= 0:
+            return False, "基准指标数据无效"
+
+        support_zone_low = ma10 - atr_multiplier * atr
+
+        if today['volume'] > avg_volume_20 * self.volume_shrink_ratio: return False, "非缩量"
+        if today['low'] >= support_zone_low: return False, "未下探动态支撑区"
+        if today['close'] < support_zone_low: return False, "未能收回动态支撑区"
+        
+        candle_range = today['high'] - today['low']
+        if candle_range < 1e-9: return False, "无波动"
+        lower_shadow = min(today['open'], today['close']) - today['low']
+        if (lower_shadow / candle_range) < lower_shadow_ratio_min:
+            return False, f"下影线力度不足(占比 < {lower_shadow_ratio_min:.0%})"
+
+        # === [4-核心抽象] 人和：微观结构确认 (通过收盘价位置来判断买盘强度) ===
+        # 杠精注释: 实盘的分钟级放量反弹，在日线上最直接的体现就是“收盘价的位置”。
+        # 一个被真实买盘控制的K线，其收盘价绝不会太难看。
+        # 我们要求收盘价必须收在当日振幅(high-low)的后65%的位置。
+        close_position_ratio = (today['close'] - today['low']) / candle_range
+        if close_position_ratio < self.upper_shadow_close_ratio_min:
+            return False, f"收盘价过于疲弱(位置 < {self.upper_shadow_close_ratio_min:.0%})，微观结构确认失败"
+
+        # ★★★ 所有审查通过，授权伏击 ★★★
+        msg = (f"V5伏击战: 日线缩量长下影，收回动态支撑区({support_zone_low:.2f})，"
+               f"且收盘价强势({close_position_ratio:.0%})，确认买盘承接。")
+        return True, msg
 
 # ==============================================================================
 # === 【买入策略】MACD趋势反转 (回测专用版) ===
