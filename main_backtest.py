@@ -61,6 +61,7 @@ SYMBOLS_TO_DOWNLOAD_CN = [
     "688668.SH","600183.SH","300548.SZ","300570.SZ","300394.SZ",
     "002195.SZ","002837.SZ","002241.SZ","600549.SH","516780.SH",
     "159770.SZ","515070.SH","159202.SZ","516100.SH","159381.SZ",
+    "159869.SZ","301076.SZ","601677.SH","002714.SZ","002078.SZ","688561.SH",
     "515010.SH","515980.SH","600410.SH","159869.SZ","600930.SH"
 ]
 # symbol_list = SYMBOLS_TO_DOWNLOAD_HK + SYMBOLS_TO_DOWNLOAD_US
@@ -148,7 +149,7 @@ strategies_to_run = [
 # --- 启动回测 ---
 if __name__ == "__main__":
 
-    is_single_stock_test:bool = True
+    is_single_stock_test:bool = False
 
     if not is_single_stock_test:
         print("--- 开始对【整个投资组合】进行回测 ---")
@@ -176,7 +177,7 @@ if __name__ == "__main__":
         output_dir = os.path.dirname(output_filename)
 
         # 3. 在写入前，确保目录存在。如果不存在，就创建它。
-        #    杠精注释：os.makedirs(..., exist_ok=True) 是幂等的，这意味着即使目录已经存在，它也不会报错。
+        #    os.makedirs(..., exist_ok=True) 是幂等的，这意味着即使目录已经存在，它也不会报错。
         #    这才是编写健壮代码的正确姿势！
         os.makedirs(output_dir, exist_ok=True)
 
