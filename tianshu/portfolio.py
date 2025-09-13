@@ -39,6 +39,15 @@ class Portfolio:
         self.equity_curve = self._construct_equity_curve()
         self.cash = initial_capital
         self.total = initial_capital
+        self.stop_loss_ratio = 0.04
+        self.strategy_names = set()
+        self.buy_percentages = {
+            "禁卫军策略(回测版)-闪电战": 1.0,
+            "禁卫军策略(回测版)-阵地战": 1.0,
+            "MACD趋势反转(60min-回测版)": 1.0,
+            "叙事性W底反转策略 (240min, 回测版)": 1.0,
+            "叙事性W底反转策略 (720min, 回测版)": 1.0,
+        }
 
     def _construct_all_positions(self):
         d = {s: pd.Series(dtype='float64') for s in self.symbol_list}
@@ -89,14 +98,21 @@ class Portfolio:
                 price = latest_bar.iloc[0]['close']
                 
                 risk_per_share = 0.0
+                fixed_risk_per_share = price * self.stop_loss_ratio
+                fixed_stop_loss_price = price - fixed_risk_per_share
                 if event.stop_loss_price and price > event.stop_loss_price:
+                    # event.stop_loss_price = min(event.stop_loss_price,fixed_stop_loss_price)
+                    # event.stop_loss_price = max(event.stop_loss_price,fixed_stop_loss_price)
+                    # event.stop_loss_price = fixed_stop_loss_price
                     risk_per_share = price - event.stop_loss_price
                 else:
-                    risk_per_share = price * 0.05 # 安全网
+                    print('执行到安全网逻辑')
+                    risk_per_share = price * self.stop_loss_ratio # 安全网
 
                 if risk_per_share <= 0: return
 
-                quantity = self._calculate_position_size(price, risk_per_share)
+                quantity = self._calculate_position_size(price, risk_per_share,strategy_name=event.strategy_name)
+                # quantity = self._calculate_position_size(price, risk_per_share,strategy_name=event.strategy_name,is_buy_percentage=False)
                 
                 if quantity > 0:
                     # --- 【核心修改】将 risk_per_share 放入 OrderEvent ---
@@ -109,15 +125,22 @@ class Portfolio:
                                        stop_loss_price=getattr(event, 'stop_loss_price', 0.0)
                                        )
                     events.put(order)
+                    # self.strategy_names.add(event.strategy_name)
+                    # print(self.strategy_names)
             
             elif event.signal_type == 'SHORT' and event.symbol in self.current_holdings:
                 quantity = self.current_holdings[event.symbol].quantity
                 order = OrderEvent(event.symbol, 'MKT', quantity, 'SELL') # 卖出时不需要风险参数
                 events.put(order)
     
-    def _calculate_position_size(self, price: float, risk_per_share: float) -> int:
+    def _calculate_position_size(self, price: float, risk_per_share: float,strategy_name:str=None,is_buy_percentage:bool=True) -> int:
         """(逻辑简化，职责更清晰)"""
-        trade_risk_amount = self.total * self.risk_per_trade
+        if is_buy_percentage:
+            trade_risk_amount = self.total * self.risk_per_trade * self.buy_percentages[strategy_name]
+            print('购买比例:',self.buy_percentages[strategy_name])
+        else:
+            trade_risk_amount = self.total * self.risk_per_trade
+        
         quantity = int(trade_risk_amount / risk_per_share)
         
         if price * quantity > self.cash:

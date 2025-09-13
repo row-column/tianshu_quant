@@ -64,8 +64,8 @@ SYMBOLS_TO_DOWNLOAD_CN = [
     "159869.SZ","301076.SZ","601677.SH","002714.SZ","002078.SZ","688561.SH",
     "515010.SH","515980.SH","600410.SH","159869.SZ","600930.SH"
 ]
-# symbol_list = SYMBOLS_TO_DOWNLOAD_HK + SYMBOLS_TO_DOWNLOAD_US
-symbol_list = SYMBOLS_TO_DOWNLOAD_CN
+symbol_list = SYMBOLS_TO_DOWNLOAD_HK + SYMBOLS_TO_DOWNLOAD_US
+# symbol_list = SYMBOLS_TO_DOWNLOAD_CN
 # symbol_list = ['01810.HK', '00981.HK',"02899.HK","1211.HK","RBRK.US",'TMDX.US','IONQ.US','RKLB.US']
 
 initial_capital = 100000.0
@@ -97,20 +97,20 @@ strategies_to_run = [
         'class': MacdReversalStrategyForBacktest,
         'params': {'k_period_minutes':60}
     },
-    # {
-    #     'class': NarrativeWBottomStrategyForBacktest,
-    #     'params': {
-    #         'k_period_minutes':240,
-    #         'ookback_period':150,
-    #         'capitulation_vol_ratio':2.0,
-    #         'volume_contraction_ratio':0.5,
-    #         'higher_low_tolerance':1.005,
-    #         'breakout_vol_ratio':1.8
-    #         }
-    # },
-    # {
-    #     'class': NarrativeWBottomStrategyForBacktest,
-    # },
+    {
+        'class': NarrativeWBottomStrategyForBacktest,
+        'params': {
+            'k_period_minutes':240,
+            'ookback_period':150,
+            'capitulation_vol_ratio':2.0,
+            'volume_contraction_ratio':0.5,
+            'higher_low_tolerance':1.005,
+            'breakout_vol_ratio':1.8
+            }
+    },
+    {
+        'class': NarrativeWBottomStrategyForBacktest,
+    },
     # {
     #     'class': MacdReversalStrategyProForBacktest,
     # },
