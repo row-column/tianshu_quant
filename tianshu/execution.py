@@ -3,6 +3,7 @@ project_path = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.append(project_path)
 from abc import ABC, abstractmethod
 from .event import FillEvent, events
+from .periods import normalize_period_key
 
 class ExecutionHandler(ABC):
     @abstractmethod
@@ -25,7 +26,8 @@ class SimulatedExecutionHandler(ExecutionHandler):
         成交价模拟：使用当前K线的收盘价，并加入滑点。
         """
         if event.type == 'ORDER':
-            bars = self.data_handler.get_latest_bars(event.symbol, N=1)
+            order_period = normalize_period_key(getattr(event, 'period', None))
+            bars = self.data_handler.get_latest_bars(event.symbol, N=1, period=order_period)
             if not bars.empty:
                 bar_data = bars.iloc[0]
                 close_price = bar_data['close']
@@ -53,10 +55,12 @@ class SimulatedExecutionHandler(ExecutionHandler):
                     initial_risk=event.initial_risk,
                     entry_strategy_name=getattr(event, 'entry_strategy_name', 'Unknown'),
                     stop_loss_price=getattr(event, 'stop_loss_price', 0.0),
-                    commission=commission
+                    commission=commission,
+                    strategy_params=getattr(event, 'strategy_params', {}),
+                    metadata=getattr(event, 'metadata', {}),
                 )
                 events.put(fill_event)
                 print(
-                    f"[{bar_data.name.strftime('%Y-%m-%d')}] 模拟成交: "
+                    f"[{bar_data.name.strftime('%Y-%m-%d %H:%M')}] 模拟成交({order_period}): "
                     f"{event.direction} {event.quantity}股 {event.symbol} @ {fill_price:.2f}"
                 )

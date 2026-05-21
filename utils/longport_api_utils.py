@@ -10,13 +10,16 @@ from typing import Optional,List
 import pandas_ta as ta
 import pandas  as pd
 import math
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 import time
 from enum import Enum
 from utils.performance_utils import thread_safe_ttl_cache,APIRateLimiter
+from tianshu.periods import normalize_period_key
 logger = logging.getLogger(__name__)
 
 quote_api_limiter = APIRateLimiter(requests_per_second=10)
+
+HISTORY_CANDLESTICK_MAX_COUNT = 1000
 
 # ==============================================================================
 # === 【天枢系统 · 数据宪章】不同K线周期的最优数据获取量 (count) 定义 ===
@@ -56,7 +59,7 @@ OPTIMAL_KLINE_COUNT_MAP = {
 def get_realtime_quote(quote_ctx: QuoteContext, symbol: str) -> Optional[SecurityQuote]:
     """
     【核心工具函数】获取单个股票的完整实时报价对象，并使用线程安全的TTL缓存。
-    
+
     返回的是长桥原始的 Quote 对象，包含了开盘、最高、最低、最新价等所有信息。
 
     Args:
@@ -95,10 +98,10 @@ def get_current_price(quote_ctx: QuoteContext, symbol: str) -> Optional[float]:
 def get_current_volume(quote_ctx: QuoteContext, symbol: str) -> int:
     """
     获取当前K线周期内的累计成交量
-    
+
     Args:
         symbol: 股票代码
-        
+
     Returns:
         int: 当前成交量，获取失败返回None
     """
@@ -125,7 +128,7 @@ def get_stock_static_info(quote_ctx: QuoteContext, symbol: str) -> Optional[Dict
     try:
         # 使用批量接口，即使只查询一个，也保持代码模式统一
         securityStaticInfo = quote_ctx.static_info([symbol])
-        
+
         # 检查响应是否有效且包含数据
         if securityStaticInfo and securityStaticInfo and len(securityStaticInfo) > 0:
             static_data = securityStaticInfo[0]
@@ -189,24 +192,24 @@ def _process_raw_bars(raw_bars: list, target_count: int) -> pd.DataFrame:
     """[辅助函数] 用于处理原始K线列表并转换为格式正确的DataFrame"""
     if not raw_bars:
         return pd.DataFrame()
-        
+
     data_list = [
-        {'timestamp': bar.timestamp, 'open': bar.open, 'high': bar.high, 
-         'low': bar.low, 'close': bar.close, 'volume': bar.volume, 
+        {'timestamp': bar.timestamp, 'open': bar.open, 'high': bar.high,
+         'low': bar.low, 'close': bar.close, 'volume': bar.volume,
          'turnover': bar.turnover} for bar in raw_bars
     ]
     df = pd.DataFrame(data_list)
-    
+
     numeric_cols = ['open', 'high', 'low', 'close', 'volume', 'turnover']
     for col in numeric_cols:
         df[col] = pd.to_numeric(df[col], errors='coerce')
     df.dropna(subset=numeric_cols, inplace=True)
-    
+
     df.drop_duplicates(subset=['timestamp'], keep='first', inplace=True)
     df.sort_values('timestamp', ascending=False, inplace=True)
-    
+
     final_df = df.head(target_count).sort_values('timestamp', ascending=True).reset_index(drop=True)
-    
+
     # [优化] 使用更健壮的时间转换
     final_df['timestamp'] = pd.to_datetime(final_df['timestamp'], unit='s', utc=True).dt.tz_convert('Asia/Shanghai')
 
@@ -224,7 +227,7 @@ def get_klines_data(quote_ctx: QuoteContext, symbol: str, count: int, period: Pe
     logger.info(f"正在为 {symbol} 获取 {count} 条【全时段】历史K线 (周期: {period})...")
     try:
         # ★★★ 使用“历史数据”专用限流器 ★★★
-        quote_api_limiter.wait() 
+        quote_api_limiter.wait()
         #动态构建API请求参数
         api_kwargs = {
             'symbol': symbol,
@@ -235,16 +238,16 @@ def get_klines_data(quote_ctx: QuoteContext, symbol: str, count: int, period: Pe
         # 只有当 trade_sessions 被显式传递时，才将其加入到请求参数中
         if trade_sessions:
             api_kwargs['trade_sessions'] = trade_sessions
-        
+
         raw_bars = quote_ctx.candlesticks(**api_kwargs)
 
         if not raw_bars:
             logger.warning(f"[{symbol}] API调用(candlesticks)未返回任何K线数据。")
             return None
-        
+
         # 数据处理函数 _process_and_convert_bars_to_df 无需改变，继续复用
         final_df = _process_and_convert_bars_to_df(raw_bars, symbol)
-        
+
         if final_df is None:
             return None
 
@@ -252,7 +255,7 @@ def get_klines_data(quote_ctx: QuoteContext, symbol: str, count: int, period: Pe
              logger.warning(f"[{symbol}] 数据不足: 目标 {count} 条, 实际获取 {len(final_df)} 条。")
         else:
              logger.info(f"[{symbol}] 成功获取 {len(final_df)} 条数据。")
-        
+
         return final_df
     except OpenApiException as e:
         logger.info(f"[{symbol}] 获取历史数据时发生API错误: {e}")
@@ -271,7 +274,7 @@ def get_history_klines_data(quote_ctx: QuoteContext, symbol: str, count: int, pe
     - 关键参数: 经测试，该接口同样支持 `trade_sessions`，确保了港股数据的完整性。
     - 最终方案: 这是满足所有需求的、最健壮的唯一选择。
     Returns:
-        pd.DataFrame or None: 
+        pd.DataFrame or None:
         - 如果成功，返回一个按【时间升序】排列的DataFrame (最旧的数据在第一行)。
         - 如果失败，返回 None。
     """
@@ -291,20 +294,20 @@ def get_history_klines_data(quote_ctx: QuoteContext, symbol: str, count: int, pe
         # 只有当 trade_sessions 被显式传递时，才将其加入到请求参数中
         if trade_sessions:
             api_kwargs['trade_sessions'] = trade_sessions
-        
+
         raw_bars = quote_ctx.history_candlesticks_by_offset(**api_kwargs)
 
         # 2. 【健壮性检查 1】在进行任何处理前，先检查API是否返回了空列表。
         if not raw_bars:
             logger.warning(f"[{symbol}] API调用(by_offset)未返回任何K线数据。股票可能上市时间不足或已退市。")
             return None
-        
+
         # 3. 【核心数据处理】调用全新的、无BUG的辅助函数。
         #    - 内部使用 to_numeric 和 dropna 清洗坏数据。
         #    - 内部正确地将时间戳转换为UTC标准时间，不做任何画蛇添足的时区转换。
         #    - 内部做了排序和去重，保证数据质量。
         final_df = _process_and_convert_bars_to_df(raw_bars, symbol)
-        
+
         if final_df is None:
             return None # 如果数据清洗后变为空，也直接返回
 
@@ -313,7 +316,7 @@ def get_history_klines_data(quote_ctx: QuoteContext, symbol: str, count: int, pe
              logger.warning(f"[{symbol}] 数据不足: 目标 {count} 条, 实际获取 {len(final_df)} 条。")
         else:
              logger.info(f"[{symbol}] 成功获取 {len(final_df)} 条数据。")
-       
+
         return final_df
 
     # 5. 【健壮性检查 3】完整的异常捕获，确保程序不会因为单个股票的数据问题而崩溃。
@@ -325,24 +328,227 @@ def get_history_klines_data(quote_ctx: QuoteContext, symbol: str, count: int, pe
         return None
 
 
+def _coerce_to_date(value) -> date:
+    """将 date/datetime/pandas Timestamp 统一转换为 date。"""
+    if isinstance(value, datetime):
+        return value.date()
+    if isinstance(value, date):
+        return value
+    if hasattr(value, "date"):
+        return value.date()
+    return pd.to_datetime(value).date()
+
+
+def _default_history_chunk_days(period: Period) -> int:
+    """
+    根据周期选择安全的日期分片长度。
+
+    长桥历史K线接口单次最多返回约1000根K线，因此分钟线必须按较小日期窗口分片。
+    """
+    period_key = normalize_period_key(period)
+    return {
+        "1m": 1,
+        "3m": 3,
+        "5m": 7,
+        "10m": 14,
+        "15m": 21,
+        "30m": 45,
+        "60m": 60,
+        "120m": 120,
+        "180m": 180,
+        "240m": 240,
+        "1d": 900,
+    }.get(period_key, 30)
+
+
+def _iter_date_ranges(start: date, end: date, chunk_days: int):
+    current_start = start
+    while current_start <= end:
+        current_end = min(current_start + timedelta(days=chunk_days - 1), end)
+        yield current_start, current_end
+        current_start = current_end + timedelta(days=1)
+
+
+def _request_history_candlesticks_by_date(
+    quote_ctx: QuoteContext,
+    symbol: str,
+    period: Period,
+    adjust_type: AdjustType,
+    start: date,
+    end: date,
+    trade_sessions: Optional[TradeSessions],
+    max_retries: int,
+):
+    api_kwargs = {
+        "symbol": symbol,
+        "period": period,
+        "adjust_type": adjust_type,
+        "start": start,
+        "end": end,
+    }
+    if trade_sessions is not None:
+        api_kwargs["trade_sessions"] = trade_sessions
+
+    for attempt in range(1, max_retries + 1):
+        try:
+            quote_api_limiter.wait()
+            return quote_ctx.history_candlesticks_by_date(**api_kwargs)
+        except OpenApiException as e:
+            logger.warning(
+                "[%s] 历史K线请求失败(%s -> %s, 周期:%s, 第%s/%s次): %s",
+                symbol, start, end, normalize_period_key(period), attempt, max_retries, e
+            )
+        except Exception as e:
+            logger.warning(
+                "[%s] 历史K线请求异常(%s -> %s, 周期:%s, 第%s/%s次): %s",
+                symbol, start, end, normalize_period_key(period), attempt, max_retries, e,
+                exc_info=False
+            )
+
+        if attempt < max_retries:
+            time.sleep(min(2 ** attempt, 8))
+
+    return None
+
+
+def _fetch_history_bars_by_date_range(
+    quote_ctx: QuoteContext,
+    symbol: str,
+    period: Period,
+    adjust_type: AdjustType,
+    start: date,
+    end: date,
+    trade_sessions: Optional[TradeSessions],
+    max_retries: int,
+):
+    raw_bars = _request_history_candlesticks_by_date(
+        quote_ctx=quote_ctx,
+        symbol=symbol,
+        period=period,
+        adjust_type=adjust_type,
+        start=start,
+        end=end,
+        trade_sessions=trade_sessions,
+        max_retries=max_retries,
+    )
+    if raw_bars is None:
+        return None
+
+    if len(raw_bars) >= HISTORY_CANDLESTICK_MAX_COUNT and start < end:
+        midpoint = start + timedelta(days=(end - start).days // 2)
+        left = _fetch_history_bars_by_date_range(
+            quote_ctx, symbol, period, adjust_type, start, midpoint, trade_sessions, max_retries
+        )
+        right = _fetch_history_bars_by_date_range(
+            quote_ctx, symbol, period, adjust_type, midpoint + timedelta(days=1), end, trade_sessions, max_retries
+        )
+        if left is None or right is None:
+            return None
+        return list(left) + list(right)
+
+    if len(raw_bars) >= HISTORY_CANDLESTICK_MAX_COUNT and start == end:
+        logger.warning(
+            "[%s] 单日%s K线返回%s根，可能触及接口上限，无法继续按日期拆分。",
+            symbol, normalize_period_key(period), len(raw_bars)
+        )
+
+    return raw_bars
+
+
+def get_history_klines_data_by_range(
+    quote_ctx: QuoteContext,
+    symbol: str,
+    period: Period,
+    adjust_type: AdjustType,
+    start,
+    end,
+    trade_sessions: Optional[TradeSessions] = TradeSessions.Intraday,
+    chunk_days: Optional[int] = None,
+    max_retries: int = 3,
+) -> Optional[pd.DataFrame]:
+    """
+    按日期范围获取历史K线，并自动分片、合并、去重、排序。
+
+    返回值约定：
+    - DataFrame: 请求成功，可能有数据，也可能为空。
+    - None: 某个分片连续失败，调用方不应保存半截数据。
+    """
+    start_date = _coerce_to_date(start)
+    end_date = _coerce_to_date(end)
+    if start_date > end_date:
+        raise ValueError(f"历史K线开始日期不能晚于结束日期: {start_date} > {end_date}")
+
+    safe_chunk_days = chunk_days or _default_history_chunk_days(period)
+    if safe_chunk_days <= 0:
+        raise ValueError(f"chunk_days 必须为正整数: {safe_chunk_days}")
+    all_frames = []
+    logger.info(
+        "正在为 %s 获取 %s 历史K线，日期范围: %s -> %s，分片: %s天",
+        symbol, normalize_period_key(period), start_date, end_date, safe_chunk_days
+    )
+
+    for chunk_start, chunk_end in _iter_date_ranges(start_date, end_date, safe_chunk_days):
+        raw_bars = _fetch_history_bars_by_date_range(
+            quote_ctx=quote_ctx,
+            symbol=symbol,
+            period=period,
+            adjust_type=adjust_type,
+            start=chunk_start,
+            end=chunk_end,
+            trade_sessions=trade_sessions,
+            max_retries=max_retries,
+        )
+        if raw_bars is None:
+            logger.error(
+                "[%s] %s 历史K线分片下载失败，终止本周期下载: %s -> %s",
+                symbol, normalize_period_key(period), chunk_start, chunk_end
+            )
+            return None
+        if not raw_bars:
+            continue
+
+        df_chunk = _process_and_convert_bars_to_df(raw_bars, symbol)
+        if df_chunk is not None and not df_chunk.empty:
+            all_frames.append(df_chunk)
+
+    if not all_frames:
+        return pd.DataFrame()
+
+    final_df = pd.concat(all_frames, axis=0)
+    final_df = final_df[~final_df.index.duplicated(keep="last")]
+    final_df.sort_index(inplace=True)
+
+    date_mask = (final_df.index.date >= start_date) & (final_df.index.date <= end_date)
+    final_df = final_df.loc[date_mask].copy()
+    logger.info(
+        "[%s] %s 历史K线获取完成，共 %s 条，范围: %s -> %s",
+        symbol,
+        normalize_period_key(period),
+        len(final_df),
+        final_df.index.min() if not final_df.empty else None,
+        final_df.index.max() if not final_df.empty else None,
+    )
+    return final_df
+
+
 def _process_and_convert_bars_to_df(raw_bars: list, symbol: str) -> Optional[pd.DataFrame]:
     """[全新辅助函数] 处理原始K线列表，进行清洗并转换为格式正确的DataFrame。"""
     if not raw_bars:
         logger.warning(f"[{symbol}] 传入的原始K线数据为空。")
         return None
-        
+
     data_list = [
-        {'timestamp': bar.timestamp, 'open': bar.open, 'high': bar.high, 
+        {'timestamp': bar.timestamp, 'open': bar.open, 'high': bar.high,
          'low': bar.low, 'close': bar.close, 'volume': bar.volume} for bar in raw_bars
     ]
     df = pd.DataFrame(data_list)
-    
+
     # 进行数据清洗
     numeric_cols = ['open', 'high', 'low', 'close', 'volume']
     for col in numeric_cols:
         df[col] = pd.to_numeric(df[col], errors='coerce')
     df.dropna(subset=numeric_cols, inplace=True)
-    
+
     if df.empty:
         logger.warning(f"[{symbol}] 数据经过清洗后变为空。")
         return None
@@ -357,7 +563,7 @@ def _process_and_convert_bars_to_df(raw_bars: list, symbol: str) -> Optional[pd.
     df.sort_index(ascending=True, inplace=True)
 
     return df
-    
+
 @thread_safe_ttl_cache(maxsize=500, ttl=30)
 def get_history_klines_data_stable(quote_ctx: QuoteContext, symbol: str, count: int, period: Period, adjust_type: AdjustType) -> Optional[pd.DataFrame]:
     """
@@ -391,7 +597,7 @@ def get_history_klines_data_stable(quote_ctx: QuoteContext, symbol: str, count: 
             if bar.timestamp not in collected_timestamps:
                 all_bars.append(bar)
                 collected_timestamps.add(bar.timestamp)
-        
+
         # 如果需要的K线不多，第一批就已满足
         if len(all_bars) >= count:
             logger.debug(f"[{symbol}] 初始请求已满足 {len(all_bars)}/{count} 条数据，无需分批。")
@@ -406,17 +612,17 @@ def get_history_klines_data_stable(quote_ctx: QuoteContext, symbol: str, count: 
             bars_per_day = _estimate_bars_per_day(period)
             # [关键] 使用更安全的动态回溯天数计算，增加缓冲区
             days_to_look_back = max(5, math.ceil(remaining_bars / bars_per_day) + 3)
-            
+
             end_date = (oldest_bar_timestamp - timedelta(seconds=1)).date()
             start_date = end_date - timedelta(days=days_to_look_back)
-            
+
             logger.debug(f"  -> 回溯请求，仍需 {remaining_bars} 条，日期范围: {start_date} -> {end_date}...")
 
             historical_bars = quote_ctx.history_candlesticks_by_date(
                 symbol=symbol
                 ,period=period
                 ,adjust_type=adjust_type
-                ,start=start_date 
+                ,start=start_date
                 ,end=end_date
             )
 
@@ -431,7 +637,7 @@ def get_history_klines_data_stable(quote_ctx: QuoteContext, symbol: str, count: 
                     all_bars.append(bar)
                     collected_timestamps.add(bar.timestamp)
                     newly_fetched_count += 1
-            
+
             if newly_fetched_count == 0:
                 logger.info(f"[{symbol}] 在日期范围 {start_date} -> {end_date} 内的数据已全部获取过，获取终止。")
                 break
@@ -471,7 +677,7 @@ def get_history_klines_data_by_date(quote_ctx: QuoteContext, symbol: str, count:
     try:
         # 3. 计算回溯周期
         days_to_fetch = math.ceil(count * 1.8) + 60
-        
+
         # 4. [关键修复] 创建正确的 `date` 对象
         end_date_obj = date.today()
         start_date_obj = end_date_obj - timedelta(days=days_to_fetch)
@@ -484,29 +690,29 @@ def get_history_klines_data_by_date(quote_ctx: QuoteContext, symbol: str, count:
             end=end_date_obj,
             adjust_type=adjust_type
         )
-        
+
         # 6. 数据校验
         if not symbol_klines:
             logger.warning(f"[{symbol}] 在 {start_date_obj} 到 {end_date_obj} 周期内API未返回任何数据。")
             return None
-        
+
         # 7. 数据处理
         data_list = [{'timestamp': bar.timestamp, 'open': bar.open, 'high': bar.high, 'low': bar.low, 'close': bar.close, 'volume': bar.volume} for bar in symbol_klines]
         df = pd.DataFrame(data_list)
-        
+
         numeric_cols = ['open', 'high', 'low', 'close', 'volume']
         for col in numeric_cols:
             df[col] = pd.to_numeric(df[col], errors='coerce')
         df.dropna(subset=numeric_cols, inplace=True)
-        
+
         if df.empty:
             return None
-            
+
         df.drop_duplicates(subset=['timestamp'], keep='first', inplace=True)
         df.sort_values('timestamp', ascending=True, inplace=True)
-        
+
         final_df = df.reset_index(drop=True)
-        
+
         logger.debug(f"[{symbol}] 数据获取成功并已缓存，返回 {len(final_df)} 条数据。")
         return final_df
 
@@ -534,14 +740,14 @@ def get_market_regime(df: pd.DataFrame, current_price: float, trend_period: int)
     """
     if df is None or len(df) < trend_period:
         return MarketRegime.IN_RANGE, f"数据不足以计算{trend_period}日MA"
-    
+
     try:
         ma_series = df['close'].rolling(window=trend_period).mean()
         latest_ma = ma_series.iloc[-1]
-        
+
         if pd.isna(latest_ma):
             return MarketRegime.IN_RANGE, f"{trend_period}日MA计算失败(NaN)"
-        
+
         latest_ma = float(latest_ma)
         threshold = latest_ma * 0.015
         upper_bound = latest_ma + threshold
@@ -585,18 +791,18 @@ def get_historical_atr(quote_ctx: QuoteContext,symbol: str,atr_period:int = 14) 
     [战略版] 计算并返回基于历史日线的、截至昨日的静态ATR。
     专门用于交易前的头寸规模计算，确保风险基石的稳定性。
     """
-    total_bars_needed = atr_period + 20 
+    total_bars_needed = atr_period + 20
     df_day = get_klines_data(quote_ctx, symbol, total_bars_needed, Period.Day, AdjustType.NoAdjust)
-    
+
     if df_day is None or len(df_day) < atr_period + 1:
         logger.warning(f"[{symbol}] 获取的日线数据不足，无法计算Historical ATR。")
         return 0.0
-    
+
     try:
         atr_series = df_day.ta.atr(length=atr_period, append=False)
         if atr_series is None or atr_series.isna().all():
             return 0.0
-        
+
         # 返回倒数第二个值，即“昨天”的ATR值，确保信号不漂移
         yesterday_atr = atr_series.iloc[-2]
         if pd.isna(yesterday_atr): return 0.0
@@ -616,7 +822,7 @@ def get_dynamic_atr(quote_ctx: QuoteContext,symbol: str,atr_period:int = 14) -> 
     # --- 步骤 1: 获取历史基准 (调用上面的函数或复用其逻辑) ---
     total_bars_needed = atr_period + 50
     df_day = get_klines_data(quote_ctx, symbol, total_bars_needed, Period.Day, AdjustType.NoAdjust)
-    
+
     if df_day is None or len(df_day) < atr_period + 1:
         return 0.0 # 无法计算历史基准
 
@@ -626,7 +832,7 @@ def get_dynamic_atr(quote_ctx: QuoteContext,symbol: str,atr_period:int = 14) -> 
         # 获取昨日的ATR值和昨日的收盘价
         yesterday_atr = atr_series.iloc[-2]
         yesterday_close = df_day['close'].iloc[-2]
-        
+
         if pd.isna(yesterday_atr) or pd.isna(yesterday_close): return 0.0
 
         # --- 步骤 2: 融合今日实时TR ---
@@ -641,10 +847,10 @@ def get_dynamic_atr(quote_ctx: QuoteContext,symbol: str,atr_period:int = 14) -> 
         # --- 步骤 3: 使用标准平滑公式，动态更新ATR ---
         # ATR = ((前一日ATR * (N-1)) + 当日TR) / N
         dynamic_atr = ((yesterday_atr * (atr_period - 1)) + current_tr) / atr_period
-        
+
         logger.info(f"[{symbol}] Dynamic ATR 计算成功: {dynamic_atr:.4f}")
         return float(dynamic_atr)
     except Exception as e:
         logger.error(f"[{symbol}] 计算Dynamic ATR时发生错误: {e}", exc_info=True)
         return 0.0 # 发生任何异常，都安全回退到0
-        
+

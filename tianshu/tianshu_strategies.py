@@ -9,6 +9,7 @@ from typing import Tuple,Optional,Dict
 from .event import SignalEvent, events
 from datetime import datetime, timezone
 from utils.market_time_utils import normalize_to_utc
+from .periods import DAY_PERIOD_KEY, normalize_period_key, period_key_to_minutes
 try:
     from scipy.signal import find_peaks
 except ImportError:
@@ -29,6 +30,15 @@ class BacktestStrategy:
         """
         self.data_handler = data_handler
         self.symbol_list = symbol_list
+        self.primary_period_key = DAY_PERIOD_KEY
+
+    def get_latest_bars(self, symbol, N=1, period=None):
+        return self.data_handler.get_latest_bars(symbol, N=N, period=period or self.primary_period_key)
+
+    def has_new_bar(self, symbol, period=None):
+        if hasattr(self.data_handler, 'has_new_bar'):
+            return self.data_handler.has_new_bar(symbol, period or self.primary_period_key)
+        return True
 
     @property
     def name(self):
@@ -45,7 +55,7 @@ class BacktestStrategy:
         """
         raise NotImplementedError("策略必须实现 calculate_signals 方法")
     
-    def calculate_atr_stop_loss(self, df_daily: pd.DataFrame,atr_stop_loss_multiplier:float = 1.8,atr_period:int=14) -> Optional[float]:
+    def calculate_atr_stop_loss(self, df_daily: pd.DataFrame,atr_stop_loss_multiplier:float = 2.0,atr_period:int=14) -> Optional[float]:
         """
         100% 复刻你的 get_historical_atr 逻辑，但在回测数据上运行。
         它计算并返回基于今日买入价和昨日ATR的精确止损价。
@@ -98,6 +108,1051 @@ class BacktestStrategy:
         
         return True, "突破日为强实体放量阳线"
 
+
+# ==============================================================================
+# === 【FT交易系统迁移】保守MA20突破买入策略 (回测专用版) ===
+# ==============================================================================
+class ConservativeMA20BreakoutBuyStrategyForBacktest(BacktestStrategy):
+    """
+    迁移自 tmp_data/trading_system_ft_by.py::_verify_buy_signal_viability。
+    只保留线上当前有效的纯买入信号逻辑，移除实时API、线程、账户和通知副作用。
+    """
+    DEFAULT_PRIMARY_PERIOD_MINUTES = 1440
+
+    def __init__(self, data_handler, symbol_list, **kwargs):
+        super().__init__(data_handler, symbol_list, **kwargs)
+        self.primary_period_key = DAY_PERIOD_KEY
+        self.lookback = kwargs.get('lookback', 100)
+        self.ma_period = kwargs.get('ma_period', 20)
+        self.long_ma_period = kwargs.get('long_ma_period', 50)
+        self.rsi_period = kwargs.get('rsi_period', 14)
+        self.breakout_volume_multiplier = kwargs.get('breakout_volume_multiplier', 1.7)
+        self.pullback_volume_multiplier = kwargs.get('pullback_volume_multiplier', 1.4)
+        self.breakout_rsi_min = kwargs.get('breakout_rsi_min', 48)
+        self.breakout_rsi_max = kwargs.get('breakout_rsi_max', 72)
+        self.pullback_rsi_min = kwargs.get('pullback_rsi_min', 50)
+        self.latent_ma20_distance = kwargs.get('latent_ma20_distance', 0.01)
+        self.target_value_pct = kwargs.get('target_value_pct', kwargs.get('buy_percentage', 0.085))
+        self.stop_loss_ratio = kwargs.get('stop_loss_ratio', 0.07)
+
+    @property
+    def name(self):
+        return "FT保守MA20突破买入(回测版)"
+
+    def calculate_signals(self, event, held_symbols: list, positions: dict):
+        if event.type != 'MARKET': return
+
+        for symbol in self.symbol_list:
+            if symbol in held_symbols: continue
+            if not self.has_new_bar(symbol): continue
+
+            passed, reason, candidate = self._verify_buy_signal_viability_backtest(symbol)
+            if not passed:
+                continue
+
+            current_timestamp = self.data_handler.get_latest_bars(symbol, N=1, period=self.primary_period_key).index[-1]
+            trigger_price = candidate['trigger_price']
+            stop_loss_price = round(trigger_price * (1 - self.stop_loss_ratio), 4)
+            print(
+                f"[{current_timestamp.strftime('%Y-%m-%d')}] ★★★ FT买入信号 ★★★\n"
+                f"  - 股票: {symbol}\n"
+                f"  - 策略: ConservativeMA20Breakout\n"
+                f"  - 原因: {reason}\n"
+                f"  - 目标市值比例: {self.target_value_pct:.2%}\n"
+                f"  - 初始止损: {stop_loss_price:.3f}"
+            )
+
+            events.put(SignalEvent(
+                symbol,
+                current_timestamp,
+                'LONG',
+                strength=1.0,
+                strategy_name="ConservativeMA20Breakout",
+                stop_loss_price=stop_loss_price,
+                period=self.primary_period_key,
+                execution_period=self.primary_period_key,
+                target_value_pct=self.target_value_pct,
+                strategy_params=candidate['strategy_params'],
+            ))
+
+    def _verify_buy_signal_viability_backtest(self, symbol: str) -> Tuple[bool, str, dict]:
+        try:
+            df = self.get_latest_bars(symbol, N=self.lookback)
+            if df is None or df.empty:
+                return False, "日线数据不足，无法计算 MA20/MA50/RSI14", {}
+
+            df = df.copy()
+            if 'timestamp' in df.columns:
+                df.sort_values('timestamp', inplace=True)
+            else:
+                df.sort_index(inplace=True)
+
+            for col in ['close', 'volume', 'low']:
+                df[col] = pd.to_numeric(df[col], errors='coerce')
+            df.dropna(subset=['close', 'volume', 'low'], inplace=True)
+
+            min_required_bars = max(self.long_ma_period, self.ma_period, self.rsi_period) + 5
+            if len(df) < min_required_bars:
+                return False, f"有效日线数据不足，需要至少{min_required_bars}根", {}
+
+            df['ma20'] = ta.sma(df['close'], length=self.ma_period)
+            df['ma50'] = ta.sma(df['close'], length=self.long_ma_period)
+            df['rsi14'] = ta.rsi(df['close'], length=self.rsi_period)
+
+            today = df.iloc[-1]
+            yesterday = df.iloc[-2]
+            day_before = df.iloc[-3]
+            day_before_yesterday = df.iloc[-4]
+
+            required_values = [
+                today['close'], today['low'], today['volume'], today['ma20'], today['ma50'], today['rsi14'],
+                yesterday['close'], yesterday['volume'], yesterday['ma20'],
+                day_before['ma20'], day_before_yesterday['ma20'],
+            ]
+            if any(pd.isna(x) for x in required_values):
+                return False, "指标存在空值，无法判断买入准入", {}
+
+            latest_close = float(today['close'])
+            latest_low = float(today['low'])
+            latest_volume = float(today['volume'])
+            latest_ma20 = float(today['ma20'])
+            latest_ma50 = float(today['ma50'])
+            latest_rsi = float(today['rsi14'])
+
+            previous_close = float(yesterday['close'])
+            previous_volume = float(yesterday['volume'])
+            previous_ma20 = float(yesterday['ma20'])
+            day_before_ma20 = float(day_before['ma20'])
+            day_before_yesterday_ma20 = float(day_before_yesterday['ma20'])
+
+            volume_vs_yesterday = latest_volume / previous_volume if previous_volume > 0 else 0.0
+            metrics = {
+                "latest_close": round(latest_close, 4),
+                "latest_low": round(latest_low, 4),
+                "latest_ma20": round(latest_ma20, 4),
+                "latest_ma50": round(latest_ma50, 4),
+                "previous_close": round(previous_close, 4),
+                "previous_ma20": round(previous_ma20, 4),
+                "rsi14": round(latest_rsi, 4),
+                "vol_ratio_vs_yesterday": round(volume_vs_yesterday, 4),
+            }
+
+            def check_breakout() -> Tuple[bool, str]:
+                crossed_up = previous_close <= previous_ma20 and latest_close > latest_ma20
+                volume_ok = volume_vs_yesterday >= self.breakout_volume_multiplier
+                rsi_ok = self.breakout_rsi_min <= latest_rsi <= self.breakout_rsi_max
+                if crossed_up and volume_ok and rsi_ok:
+                    return True, f"强势突破MA20 | 量比昨日:{volume_vs_yesterday:.2f}x | RSI:{latest_rsi:.1f}"
+                return False, ""
+
+            def check_pullback() -> Tuple[bool, str]:
+                held_ma20 = latest_low >= latest_ma20 and latest_close >= latest_ma20
+                volume_ok = volume_vs_yesterday >= self.pullback_volume_multiplier
+                rsi_ok = latest_rsi >= self.pullback_rsi_min
+                if held_ma20 and volume_ok and rsi_ok:
+                    return True, f"稳健低吸(不破MA20) | 量比昨日:{volume_vs_yesterday:.2f}x | RSI:{latest_rsi:.1f}"
+                return False, ""
+
+            def check_latent_entry() -> Tuple[bool, str]:
+                lower_bound = latest_ma20 * (1 - self.latent_ma20_distance)
+                near_ma20_below = lower_bound <= latest_close < latest_ma20
+                ma20_turning_up = (
+                    latest_ma20 > previous_ma20
+                    and (previous_ma20 <= day_before_ma20 or day_before_ma20 <= day_before_yesterday_ma20)
+                )
+                above_ma50 = latest_close > latest_ma50
+                if near_ma20_below and ma20_turning_up and above_ma50:
+                    distance_to_ma20 = latest_close / latest_ma20 - 1
+                    return True, f"潜伏买点 | 2周期内MA20拐头向上 | 站稳MA50 | 距MA20:{distance_to_ma20:.2%}"
+                return False, ""
+
+            matched_reason = ""
+            for condition in [check_breakout, check_pullback, check_latent_entry]:
+                matched, reason = condition()
+                if matched:
+                    matched_reason = reason
+                    break
+
+            if not matched_reason:
+                return False, (
+                    f"三大条件均未满足 | 现价:{latest_close:.2f} "
+                    f"量比昨日:{volume_vs_yesterday:.2f}x RSI:{latest_rsi:.1f}"
+                ), {}
+
+            candidate = {
+                "symbol": symbol,
+                "trigger_price": latest_close,
+                "strategy_name": "ConservativeMA20Breakout",
+                "strategy_class_name": "ConservativeMA20Breakout",
+                "strategy_params": {
+                    "entry_signal": metrics,
+                    "conservative_exit_state": {
+                        "highest_price": latest_close,
+                        "stage_10_taken": False,
+                        "stage_15_taken": False,
+                        "entered_10_15_at": None,
+                        "entered_15_20_at": None,
+                    }
+                }
+            }
+            return True, matched_reason, candidate
+        except Exception as e:
+            return False, f"保守MA20买入准入检查异常: {e}", {}
+
+
+# ==============================================================================
+# === 【FT交易系统迁移】保守退出策略 (回测专用版) ===
+# ==============================================================================
+class ConservativeExitStrategyForBacktest(BacktestStrategy):
+    """
+    迁移自 tmp_data/trading_system_ft_by.py::_check_position_signals 当前有效的前半段。
+    """
+    DEFAULT_PRIMARY_PERIOD_MINUTES = 1440
+
+    def __init__(self, data_handler, symbol_list, **kwargs):
+        super().__init__(data_handler, symbol_list, **kwargs)
+        self.primary_period_key = DAY_PERIOD_KEY
+        self.hard_stop_roi = kwargs.get('hard_stop_roi', -0.07)
+        self.full_take_profit_roi = kwargs.get('full_take_profit_roi', 0.20)
+        self.peak_profit_roi = kwargs.get('peak_profit_roi', 0.05)
+        self.peak_drawdown_to_exit = kwargs.get('peak_drawdown_to_exit', 0.02)
+        self.time_stop_days = kwargs.get('time_stop_days', 14)
+        self.time_stop_min_roi = kwargs.get('time_stop_min_roi', 0.10)
+        self.band_hold_days = kwargs.get('band_hold_days', 7)
+        self.stage_10_roi = kwargs.get('stage_10_roi', 0.10)
+        self.stage_15_roi = kwargs.get('stage_15_roi', 0.15)
+        self.stage_10_sell_ratio = kwargs.get('stage_10_sell_ratio', 0.35)
+        self.stage_15_sell_ratio = kwargs.get('stage_15_sell_ratio', 0.45)
+
+    @property
+    def name(self):
+        return "FT保守退出策略(回测版)"
+
+    def calculate_signals(self, event, held_symbols: list, positions: dict):
+        if event.type != 'MARKET': return
+
+        for symbol in held_symbols:
+            if not self.has_new_bar(symbol): continue
+            position = positions.get(symbol)
+            if position is None or position.quantity <= 0:
+                continue
+
+            df = self.get_latest_bars(symbol, N=1)
+            if df.empty:
+                continue
+            current_timestamp = df.index[-1]
+            current_price = float(df.iloc[-1]['close'])
+            if current_price <= 0 or position.avg_cost <= 0:
+                continue
+
+            signal = self._check_position_signal(symbol, position, current_price, current_timestamp)
+            if signal:
+                events.put(signal)
+
+    def _check_position_signal(self, symbol: str, position, current_price: float, current_timestamp):
+        cost_price = float(position.avg_cost)
+        roi = (current_price - cost_price) / cost_price
+        holding_days = (pd.Timestamp(current_timestamp) - pd.Timestamp(position.entry_timestamp)).total_seconds() / 86400.0
+
+        state = position.strategy_params.setdefault('conservative_exit_state', {})
+        highest_price = float(state.get('highest_price') or cost_price)
+        if current_price > highest_price:
+            highest_price = current_price
+            state['highest_price'] = round(highest_price, 4)
+
+        peak_roi = (highest_price - cost_price) / cost_price if cost_price > 0 else 0.0
+        drawdown_from_peak = (highest_price - current_price) / highest_price if highest_price > 0 else 0.0
+
+        if roi <= self.hard_stop_roi:
+            return self._sell_signal(symbol, current_timestamp, 1.0, f"单只个股硬止损7%触发 | ROI:{roi:.2%}")
+
+        if roi >= self.full_take_profit_roi:
+            return self._sell_signal(symbol, current_timestamp, 1.0, f"浮盈达到20%清仓 | ROI:{roi:.2%}")
+
+        if peak_roi >= self.peak_profit_roi and drawdown_from_peak >= self.peak_drawdown_to_exit:
+            return self._sell_signal(
+                symbol,
+                current_timestamp,
+                1.0,
+                f"盈利超过5%后从高点回撤2%清仓 | 峰值ROI:{peak_roi:.2%}, 回撤:{drawdown_from_peak:.2%}"
+            )
+
+        if roi < self.time_stop_min_roi and holding_days > self.time_stop_days:
+            return self._sell_signal(symbol, current_timestamp, 1.0, f"未达10%浮盈且持仓超过2周 | ROI:{roi:.2%}, 持仓:{holding_days:.1f}天")
+
+        state_changed = False
+        if self.stage_10_roi <= roi < self.stage_15_roi and not state.get('entered_10_15_at'):
+            state['entered_10_15_at'] = pd.Timestamp(current_timestamp).isoformat()
+            state_changed = True
+        elif not (self.stage_10_roi <= roi < self.stage_15_roi) and state.get('entered_10_15_at') and not state.get('stage_10_taken'):
+            state['entered_10_15_at'] = None
+            state_changed = True
+
+        if self.stage_15_roi <= roi < self.full_take_profit_roi and not state.get('entered_15_20_at'):
+            state['entered_15_20_at'] = pd.Timestamp(current_timestamp).isoformat()
+            state_changed = True
+        elif not (self.stage_15_roi <= roi < self.full_take_profit_roi) and state.get('entered_15_20_at') and not state.get('stage_15_taken'):
+            state['entered_15_20_at'] = None
+            state_changed = True
+
+        if state_changed:
+            position.strategy_params['conservative_exit_state'] = state
+
+        if (
+            self.stage_10_roi <= roi < self.stage_15_roi
+            and self._days_since(current_timestamp, state.get('entered_10_15_at')) > self.band_hold_days
+        ):
+            return self._sell_signal(symbol, current_timestamp, 1.0, f"浮盈10%-15%区间持仓超过一周 | ROI:{roi:.2%}")
+
+        if (
+            self.stage_15_roi <= roi < self.full_take_profit_roi
+            and self._days_since(current_timestamp, state.get('entered_15_20_at')) > self.band_hold_days
+        ):
+            return self._sell_signal(symbol, current_timestamp, 1.0, f"浮盈15%-20%区间持仓超过一周 | ROI:{roi:.2%}")
+
+        stage_10_taken = bool(state.get('stage_10_taken'))
+        stage_15_taken = bool(state.get('stage_15_taken'))
+
+        if roi >= self.stage_15_roi and not stage_10_taken:
+            return self._sell_signal(
+                symbol,
+                current_timestamp,
+                self.stage_10_sell_ratio,
+                f"浮盈达到10%阶段止盈 | 当前ROI:{roi:.2%}",
+                stage_flag='stage_10_taken',
+            )
+
+        if roi >= self.stage_15_roi and not stage_15_taken:
+            return self._sell_signal(
+                symbol,
+                current_timestamp,
+                self.stage_15_sell_ratio,
+                f"浮盈达到15%阶段止盈 | 当前ROI:{roi:.2%}",
+                stage_flag='stage_15_taken',
+            )
+
+        if roi >= self.stage_10_roi and not stage_10_taken:
+            return self._sell_signal(
+                symbol,
+                current_timestamp,
+                self.stage_10_sell_ratio,
+                f"浮盈达到10%阶段止盈 | 当前ROI:{roi:.2%}",
+                stage_flag='stage_10_taken',
+            )
+
+        return None
+
+    def _days_since(self, current_timestamp, timestamp_text) -> float:
+        if not timestamp_text:
+            return -1.0
+        try:
+            return (pd.Timestamp(current_timestamp) - pd.Timestamp(timestamp_text)).total_seconds() / 86400.0
+        except Exception:
+            return -1.0
+
+    def _sell_signal(self, symbol: str, timestamp, percentage: float, reason: str, stage_flag: str = None):
+        print(
+            f"[{pd.Timestamp(timestamp).strftime('%Y-%m-%d')}] ◆◆◆ FT卖出信号 ◆◆◆\n"
+            f"  - 股票: {symbol}\n"
+            f"  - 策略: {self.name}\n"
+            f"  - 卖出比例: {percentage:.0%}\n"
+            f"  - 原因: {reason}"
+        )
+        return SignalEvent(
+            symbol,
+            timestamp,
+            'SHORT',
+            strength=percentage,
+            strategy_name=self.name,
+            period=self.primary_period_key,
+            execution_period=self.primary_period_key,
+            metadata={'conservative_exit_stage_flag': stage_flag} if stage_flag else {},
+        )
+
+
+# ==============================================================================
+# === 【买入策略 V2.0】MACD结构性反转 (高保真·日线抽象回测版) ===
+# ==============================================================================
+class MacdStructuralReversalStrategyV2ForBacktest(BacktestStrategy):
+    """
+    【V2.1 最终修复与加固版】MACD结构性反转系统
+
+    **更新日志 (V2.1):**
+    - [致命BUG修复] 彻底修复了`_find_high_quality_divergence`函数中的“时空错配”问题。
+      旧代码会持续发现历史上的陈旧信号，导致微观确认永远因“超时”而失败。
+      新代码强制要求信号的确认点必须在“近期”形成，完美模拟实盘行为。
+    - [健壮性加固] 为所有可能因数据不足或索引错误导致崩溃的地方，增加了防御性编程。
+    - [日志优化] 优化了诊断日志的输出逻辑，使其更清晰地反映策略决策链条。
+    """
+    def __init__(self, data_handler, symbol_list, **kwargs):
+        super().__init__(data_handler, symbol_list, **kwargs)
+        self.daily_long_ema_period: int = kwargs.get('daily_long_ema_period', 60)
+        self.rsi_period: int = kwargs.get('rsi_period', 14)
+        self.rsi_threshold: float = kwargs.get('rsi_threshold', 35.0)
+        self.divergence_min_distance: int = kwargs.get('divergence_min_distance', 5)
+        self.volume_multiplier: float = kwargs.get('volume_multiplier', 1.5)
+        self.breakout_candle_strength_ratio: float = kwargs.get('breakout_candle_strength_ratio', 0.6)
+        self.signal_timeout_days: int = kwargs.get('signal_timeout_days', 5)
+        self.atr_period: int = kwargs.get('atr_period', 14)
+
+    @property
+    def name(self) -> str:
+        return "MACD结构性反转V2.1 (日线抽象回测版)"
+
+    def calculate_signals(self, event, held_symbols: list, positions: dict):
+        if event.type != 'MARKET': return
+
+        for s in self.symbol_list:
+            if s in held_symbols: continue
+            
+            df_daily = self.data_handler.get_latest_bars(s, N=self.daily_long_ema_period + 100)
+            if df_daily.empty or len(df_daily) < self.daily_long_ema_period + 50: continue
+
+            current_date_str = df_daily.index[-1].strftime('%Y-%m-%d')
+
+            # --- 步骤 1: [宏观过滤] ---
+            is_uptrend, trend_msg = self._check_daily_uptrend_filter_backtest(df_daily.iloc[:-1]) # 用昨天的数据判断趋势
+            if not is_uptrend: continue
+
+            # --- 步骤 2: [中观信号] ---
+            df_for_signal_search = df_daily.iloc[:-1] # 我们永远在昨天的数据里找信号
+            signal_packet = self._find_high_quality_divergence_v2_backtest(df_for_signal_search)
+            if not signal_packet: continue
+                
+            # --- 步骤 3: [微观确认] ---
+            is_confirmed, confirmation_msg = self._final_confirmation_backtest(df_daily, signal_packet)
+            if not is_confirmed:
+                # 只有当中观信号出现，但微观确认失败时，才打印最关键的诊断日志
+                print(f"\n>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>")
+                print(f"[{current_date_str}][{s}] 诊断报告:")
+                print(f"  - [宏观]: 通过 ({trend_msg})")
+                print(f"  - [中观]: 发现高质量信号! ({signal_packet['description']})")
+                print(f"  - [微观]: ★★★ 确认失败! ★★★")
+                print(f"  -   失败原因: {confirmation_msg}")
+                print(f"<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<")
+                continue
+            
+            # ★★★ 三步确认全部通过 ★★★
+            current_timestamp = df_daily.index[-1]
+            stop_loss_price = self.calculate_atr_stop_loss(df_daily, atr_period=self.atr_period)
+            if stop_loss_price is None: continue
+
+            print(
+                f"\n=================================================="
+                f"[{current_timestamp.strftime('%Y-%m-%d')}] ★★★ MACD反转V2.1·买入信号 ★★★\n"
+                f"  - 股票: {s}\n"
+                f"  - 宏观趋势: {trend_msg}\n"
+                f"  - 中观信号: {signal_packet['description']}\n"
+                f"  - 微观确认: {confirmation_msg}\n"
+                f"  - 科学止损价: {stop_loss_price:.2f}\n"
+                f"=================================================="
+            )
+            signal = SignalEvent(s, current_timestamp, 'LONG', strategy_name=self.name, stop_loss_price=stop_loss_price)
+            events.put(signal)
+
+    def _check_daily_uptrend_filter_backtest(self, df: pd.DataFrame) -> Tuple[bool, str]:
+        try:
+            df_copy = df.copy()
+            df_copy['ema_long'] = ta.ema(df_copy['close'], length=self.daily_long_ema_period)
+            if df_copy.empty: return False, "数据为空"
+            latest = df_copy.iloc[-1]
+            if pd.isna(latest['ema_long']): return False, "长周期EMA数据不足"
+            if latest['close'] < latest['ema_long']: return False, f"价格({latest['close']:.2f})在EMA{self.daily_long_ema_period}({latest['ema_long']:.2f})之下"
+            return True, f"价格在EMA{self.daily_long_ema_period}之上"
+        except Exception:
+            return False, "计算日线趋势时异常"
+
+    def _find_high_quality_divergence_v2_backtest(self, df: pd.DataFrame) -> Optional[Dict]:
+        """[中观层 V2.1 修复版] 强制执行“信号新鲜度”检查。"""
+        if len(df) < 35: return None
+        df_copy = df.copy()
+        try:
+            macd = ta.macd(df_copy['close'], fast=12, slow=26, signal=9)
+            df_copy['dif'] = macd['MACD_12_26_9']
+            df_copy['rsi'] = ta.rsi(df_copy['close'], length=self.rsi_period)
+            df_copy['vol_ema'] = ta.ema(df_copy['volume'], length=20)
+            df_copy.dropna(inplace=True)
+            if len(df_copy) < 20: return None
+        except Exception: return None
+
+        price_lows_indices, _ = find_peaks(-df_copy['low'], distance=self.divergence_min_distance)
+        dif_lows_indices, _ = find_peaks(-df_copy['dif'], distance=self.divergence_min_distance)
+        if len(price_lows_indices) < 2 or len(dif_lows_indices) < 2: return None
+
+        last_price_low_idx = price_lows_indices[-1]
+        prev_price_low_idx = price_lows_indices[-2]
+        
+        # =================================================================
+        # === 【V2.1 核心修正：信号新鲜度强制检查】 START ===
+        # =================================================================
+        # 信号的确认点(last_price_low_idx)，距离我们扫描的那天（即df的最后一天），
+        # 间隔不能超过信号有效期。这确保了我们只处理“刚刚”形成的信号。
+        days_since_signal = (len(df_copy) - 1) - last_price_low_idx
+        if days_since_signal > self.signal_timeout_days:
+            # 这个信号是陈旧的，直接枪毙，不给它任何机会进入后续流程。
+            return None
+        # =================================================================
+        # === 【V2.1 核心修正：信号新鲜度强制检查】 END ===
+        # =================================================================
+
+        price_low_1 = df_copy['low'].iloc[prev_price_low_idx]
+        price_low_2 = df_copy['low'].iloc[last_price_low_idx]
+        
+        # [健壮性加固]
+        try:
+            dif_lows_before_p2 = dif_lows_indices[dif_lows_indices <= last_price_low_idx]
+            if len(dif_lows_before_p2) < 2: return None
+            last_dif_low_idx = dif_lows_before_p2[-1]
+            prev_dif_low_idx = dif_lows_before_p2[dif_lows_before_p2 < last_dif_low_idx][-1]
+        except IndexError:
+            return None # 如果找不到对齐的DIF波谷，直接返回
+
+        dif_low_1 = df_copy['dif'].iloc[prev_dif_low_idx]
+        dif_low_2 = df_copy['dif'].iloc[last_dif_low_idx]
+        
+        is_divergence = (price_low_2 < price_low_1) and (dif_low_2 > dif_low_1)
+        if not is_divergence: return None
+
+        rsi_at_divergence = df_copy['rsi'].iloc[last_price_low_idx]
+        if rsi_at_divergence > self.rsi_threshold: return None
+
+        volume_profile = df_copy['volume'].iloc[prev_price_low_idx:last_price_low_idx+1]
+        if volume_profile.mean() > df_copy['vol_ema'].iloc[prev_price_low_idx]: return None
+            
+        neckline_price = df_copy['high'].iloc[prev_price_low_idx : last_price_low_idx + 1].max()
+        
+        signal_packet = {
+            "signal_day_index_in_original_df": df.index.get_loc(df_copy.index[last_price_low_idx]),
+            "neckline_price": neckline_price,
+            "description": f"日线高质量底背离, 颈线:{neckline_price:.2f}, RSI:{rsi_at_divergence:.1f}"
+        }
+        return signal_packet
+
+    def _final_confirmation_backtest(self, df: pd.DataFrame, signal_packet: Dict) -> Tuple[bool, str]:
+        """[微观层 V2.1] 审查“今天”的K线是否为高质量的突破阳线。"""
+        today_candle = df.iloc[-1]
+        today_index_in_original_df = len(df) - 1
+        
+        signal_day_index = signal_packet['signal_day_index_in_original_df']
+        neckline_price = signal_packet['neckline_price']
+
+        # 1. 信号时效性检查 (这是第二道防线，理论上第一道已经过滤掉了)
+        if today_index_in_original_df - signal_day_index > self.signal_timeout_days:
+            # 这里的超时，现在意味着“信号刚形成，但今天离形成日已经过去了几天”
+            return False, f"信号等待超时({today_index_in_original_df - signal_day_index}天 > {self.signal_timeout_days}天)"
+
+        # 2. 突破站稳
+        if today_candle['close'] <= neckline_price:
+            return False, f"等待价格突破颈线 {neckline_price:.2f}"
+            
+        # 3. 价量共振
+        avg_volume = df['volume'].iloc[-11:-1].mean()
+        if avg_volume > 0 and today_candle['volume'] < avg_volume * self.volume_multiplier:
+            return False, f"突破颈线但成交量不足"
+        
+        # 4. K线形态
+        if today_candle['close'] <= today_candle['open']:
+            return False, "突破日非阳线"
+            
+        candle_range = today_candle['high'] - today_candle['low']
+        if candle_range < 1e-9: return True, "一字板涨停突破"
+        
+        candle_body = today_candle['close'] - today_candle['open']
+        if (candle_body / candle_range) < self.breakout_candle_strength_ratio:
+            return False, f"突破日K线实体过弱"
+
+        # 5. 抽象5分钟金叉
+        close_position_ratio = (today_candle['close'] - today_candle['low']) / candle_range
+        if close_position_ratio < 0.7:
+            return False, "收盘价位置疲弱"
+
+        return True, f"日线放量强阳线突破颈线({neckline_price:.2f})，且收盘价强势"
+    
+# ==============================================================================
+# === 【买入策略】MACD结构性反转 (高保真·日线抽象回测版) ===
+# ==============================================================================
+class MacdStructuralReversalStrategyForBacktest(BacktestStrategy):
+    """
+    【高保真·日线抽象回测版】MACD结构性反转系统
+
+    **策略哲学:** 
+    本回测策略100%忠于原版“二级火箭”的交易哲学，并采用“逻辑等价代换”的专业方法论，
+    将原策略的多时间框架逻辑进行了高保真度的“降维”抽象，使其完美适配日线回测环境。
+
+    **核心逻辑 (二级火箭·日线抽象版):**
+
+    1.  **第一级: 高质量信号引擎 (日线级别)**
+        -   **目标:** 在日线图上，复现原版策略在主周期上的所有筛选逻辑，识别出真正具有
+                  中期反转潜力的“A级”日线MACD底背离信号。
+        -   **实现:**
+            a.  **科学寻峰:** 100%复刻，采用 `scipy.signal.find_peaks` 在日线图上定位波谷。
+            b.  **多维验证:** 100%复刻，一个高质量的日线背离必须同时满足：
+                -   **形态清晰:** 日线价格创新低，日线DIF未创新低。
+                -   **动能衰竭:** 背离期间，日线MACD绿柱趋势性收缩。
+                -   **周期合理:** 日线背离的形成周期被严格限制。
+                -   **指标共振:** 引入日线RSI作为辅助验证。
+        -   **产出:** 一个包含日线级别关键信息的“信号包” (Signal Packet)。
+
+    2.  **第二级: 结构性突破狙击镜 (日线K线形态确认)**
+        -   **目标:** 杜绝左侧“猜底”，只在市场本身确认反转结构后才入场。
+        -   **实现:**
+            a.  **降维抽象:** 原版对15分钟K线的“微观结构分析”，被抽象为对**“突破日”当天
+                  的日线K线本身的质量审查**。
+            b.  **颈线确认:** 日线级别的“W底颈线”= 两个价格波谷之间K线的最高点。
+            c.  **最终扳机:** 一个完美的日线突破，必须是**一根强实体的、成交量显著放大的、
+                  收盘价决定性站上日线颈线的阳线**。这根K线本身就是对所有微观突破信号的
+                  最终确认。
+
+    **【重要声明】:**
+    本回测策略完美地将原版策略的思想移植到了日线回测框架中，确保了回测的逻辑一致性。
+    """
+    def __init__(self, data_handler, symbol_list, **kwargs):
+        """
+        构造函数。所有参数均可配置，这才是专业交易系统。
+        """
+        super().__init__(data_handler, symbol_list, **kwargs)
+
+        # --- [1] 信号发现参数 (100%复刻原版逻辑) ---
+        self.divergence_min_period: int = kwargs.get('divergence_min_period', 8)          # 背离形成的最小K线数
+        self.divergence_max_period: int = kwargs.get('divergence_max_period', 40)         # 背离形成的最大K线数
+        self.rsi_period: int = kwargs.get('rsi_period', 14)                             # RSI周期
+        self.rsi_oversold_threshold: float = kwargs.get('rsi_oversold_threshold', 40)     # RSI弱势区阈值
+        self.atr_period: int = kwargs.get('atr_period', 14)                             # 用于计算止损
+
+        # --- [2] 结构确认参数 (基于日线K线抽象) ---
+        self.volume_multiplier: float = kwargs.get('volume_multiplier', 1.5)              # 突破日成交量放大的倍数
+        self.breakout_candle_strength_ratio: float = kwargs.get('breakout_candle_strength_ratio', 0.6) # 突破日K线实体强度
+
+        # --- [3] 信号时效性参数 ---
+        # 杠精注释: 在日线回测中，“超时”意味着背离信号出现后，N天内仍未出现突破K线。
+        self.signal_timeout_days: int = kwargs.get('signal_timeout_days', 5)              # 信号有效期（天）
+    
+    @property
+    def name(self) -> str:
+        # 名字必须清晰地反映出它的血统和用途
+        return "MACD结构性反转 (日线抽象回测版)"
+
+    def calculate_signals(self, event, held_symbols: list, positions: dict):
+        """
+        策略主入口：在每个交易日，执行“择机”与“确认”的二级火箭逻辑。
+        """
+        if event.type != 'MARKET':
+            return
+
+        for s in self.symbol_list:
+            if s in held_symbols:
+                continue
+            
+            # --- 数据准备：一次性获取所有分析所需的数据 ---
+            # MACD需要较多数据预热，150天是稳妥的选择
+            df_daily = self.data_handler.get_latest_bars(s, N=150)
+            if df_daily.empty or len(df_daily) < 100:
+                continue
+
+            # 【诊断代码】获取当前日期，方便追踪
+            current_date_str = df_daily.index[-1].strftime('%Y-%m-%d')
+
+            # --- 第一级火箭: 寻找高质量背离信号 ---
+            # 我们在截至“昨天”的数据中寻找信号，用“今天”的数据来验证突破
+            df_for_signal_search = df_daily.iloc[:-1]
+            signal_packet = self._find_high_quality_divergence_backtest(df_for_signal_search)
+
+            # 【诊断代码】检查第一级火箭是否点火
+            if not signal_packet:
+                # 为了避免刷屏，可以只在特定日期或股票上打印
+                # print(f"[{current_date_str}][{s}] 诊断: 第一级火箭未点火 (未找到高质量背离信号)。")
+                continue
+            else:
+                # 只要找到信号，就立即打印出来！
+                print(f"\n>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>")
+                print(f"[{current_date_str}][{s}] 诊断: 第一级火箭点火成功！")
+                print(f"   - 信号详情: {signal_packet['description']}")
+                print(f"<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<")
+
+                
+            # --- 第二级火箭: 结构性突破狙击镜 ---
+            # 用“今天”的K线，去确认“昨天”及以前找到的信号
+            is_confirmed, confirmation_msg = self._confirm_structural_breakout_backtest(df_daily, signal_packet)
+            
+            # 【诊断代码】检查第二级火箭是否点火
+            if not is_confirmed:
+                # 打印出为什么没有确认，这至关重要！
+                print(f"[{current_date_str}][{s}] 诊断: 第二级火箭点火失败！")
+                print(f"   - 失败原因: {confirmation_msg}")
+                continue
+            
+            # ★★★ 如果两级火箭都成功点火，则生成买入信号 ★★★
+            current_timestamp = df_daily.index[-1]
+            
+            # --- 信号确认，计算科学止损价 ---
+            # 杠精铁律: 没有科学止损的交易，就是赌博。
+            stop_loss_price = self.calculate_atr_stop_loss(
+                df_daily,
+                atr_period=self.atr_period
+            )
+            if stop_loss_price is None:
+                continue
+
+            print(
+                f"[{current_timestamp.strftime('%Y-%m-%d')}] ★★★ MACD结构性反转·买入信号 ★★★\n"
+                f"  - 股票: {s}\n"
+                f"  - 信号详情: {signal_packet['description']}\n"
+                f"  - 确认逻辑: {confirmation_msg}\n"
+                f"  - 科学止损价: {stop_loss_price:.2f}"
+            )
+            signal = SignalEvent(s, current_timestamp, 'LONG', strategy_name=self.name, stop_loss_price=stop_loss_price)
+            events.put(signal)
+
+    def _find_high_quality_divergence_backtest(self, df: pd.DataFrame) -> Optional[Dict]:
+        """
+        【核心 V2.0 修复版】高质量信号引擎：增加“信号新鲜度”检查。
+        """
+        # 1. 数据量前置检查
+        if len(df) < 60: return None
+
+        # 2. 指标计算
+        try:
+            # 杠精注释：df.ta.macd() 会在原DataFrame上追加列，这是个副作用。
+            # 在专业系统中，我们会用 df.copy() 来避免污染原始数据，但在这里为了效率可以接受。
+            df.ta.macd(fast=12, slow=26, signal=9, append=True)
+            df.ta.rsi(length=self.rsi_period, append=True)
+            df.dropna(inplace=True)
+            if df.empty: return None
+        except Exception:
+            return None
+
+        # 3. 科学寻找波谷 (价格和DIF)
+        price_lows_indices, _ = find_peaks(-df['low'], distance=5)
+        dif_lows_indices, _ = find_peaks(-df['MACD_12_26_9'], distance=5)
+
+        if len(price_lows_indices) < 2 or len(dif_lows_indices) < 2:
+            return None
+
+        # 4. 遍历最新的价格波谷，寻找最近的有效背离形态
+        p_low_idx_2 = price_lows_indices[-1]
+        p_low_idx_1 = price_lows_indices[-2]
+        
+        # =================================================================
+        # === 【手术刀级别的核心修正】 START ===
+        # =================================================================
+        # 我们必须确保这个信号是“新鲜”的。信号的确认点(p_low_idx_2)
+        # 必须是最近几根K线内形成的。否则，我们就会在今天去分析一个月前的旧信号。
+        # 我们定义“新鲜”为：信号的第二个低点，距离我们扫描的那天（即df的最后一天）不超过N根K线。
+        # 这个N，实际上就是我们的信号有效期 signal_timeout_days。
+        signal_freshness_period = self.signal_timeout_days 
+        # df的最后一个索引位置是 len(df) - 1
+        if (len(df) - 1) - p_low_idx_2 > signal_freshness_period:
+            # 如果信号点距离现在太远，直接判定为“陈旧信号”，予以枪毙。
+            # 【诊断代码，可选】 print(f"诊断: 发现陈旧信号，确认点在 {p_low_idx_2}，距离现在 {(len(df) - 1) - p_low_idx_2} 天，已忽略。")
+            return None
+        # =================================================================
+        # === 【手术刀级别的核心修正】 END ===
+        # =================================================================
+
+        # 条件a: 价格创新低
+        if df['low'].iloc[p_low_idx_2] >= df['low'].iloc[p_low_idx_1]:
+            return None
+            
+        # 条件b: 周期合理性
+        period_span = p_low_idx_2 - p_low_idx_1
+        if not (self.divergence_min_period <= period_span <= self.divergence_max_period):
+            return None
+        
+        # 寻找对应的DIF波谷
+        dif_lows_before_p2 = dif_lows_indices[dif_lows_indices <= p_low_idx_2]
+        if len(dif_lows_before_p2) < 2: return None
+        corresponding_dif_low_idx_2 = dif_lows_before_p2[-1]
+        
+        # 健壮性检查：确保能找到前一个波谷
+        dif_lows_before_cd2 = dif_lows_before_p2[dif_lows_before_p2 < corresponding_dif_low_idx_2]
+        if len(dif_lows_before_cd2) == 0: return None
+        corresponding_dif_low_idx_1 = dif_lows_before_cd2[-1]
+
+        # 条件c: DIF未创新低 (形成更高低点)
+        if df['MACD_12_26_9'].iloc[corresponding_dif_low_idx_2] <= df['MACD_12_26_9'].iloc[corresponding_dif_low_idx_1]:
+            return None
+            
+        # 条件d: 动能衰竭 (MACD绿柱收缩)
+        hist_slice = df['MACDh_12_26_9'].iloc[p_low_idx_1 : p_low_idx_2 + 1]
+        if hist_slice[hist_slice > 0].any():
+             return None
+
+        # 条件e: RSI指标共振
+        if df[f'RSI_{self.rsi_period}'].iloc[p_low_idx_2] > self.rsi_oversold_threshold:
+            return None
+
+        # ★★★ 所有条件满足，高质量日线信号诞生！★★★
+        neckline_price = df['high'].iloc[p_low_idx_1 : p_low_idx_2 + 1].max()
+
+        signal_packet = {
+            # 这个索引现在是相对于 df_for_signal_search 的
+            "signal_day_index": p_low_idx_2, 
+            "neckline_price": neckline_price,
+            "description": f"日线底背离(周期:{period_span}天), 颈线:{neckline_price:.2f}",
+        }
+        return signal_packet
+
+    def _confirm_structural_breakout_backtest(self, df: pd.DataFrame, signal_packet: Dict) -> Tuple[bool, str]:
+        """
+        【核心】结构性突破狙击镜：审查“今天”的日线K线，确认其是否为一根高质量的突破阳线。
+        """
+        today_candle = df.iloc[-1]
+        today_index = len(df) - 1
+        
+        signal_day_index = signal_packet['signal_day_index']
+        neckline_price = signal_packet['neckline_price']
+
+        # 1. 信号时效性检查
+        if today_index - signal_day_index > self.signal_timeout_days:
+            return False, f"信号超时({today_index - signal_day_index}天 > {self.signal_timeout_days}天)"
+
+        # 2. 突破条件检查：收盘价必须决定性地站上颈线
+        if today_candle['close'] <= neckline_price:
+            return False, f"等待价格突破颈线 {neckline_price:.2f}"
+            
+        # 3. 成交量确认：突破必须放量，没有成交量的突破都是耍流氓
+        # 计算突破前一段时间的平均成交量
+        avg_volume = df['volume'].iloc[-11:-1].mean() # 突破前10天均量
+        if avg_volume > 0 and today_candle['volume'] < avg_volume * self.volume_multiplier:
+            return False, f"已突破颈线但成交量不足 (今日: {today_candle['volume']:.0f}, 要求 > {avg_volume * self.volume_multiplier:.0f})"
+        
+        # 4. K线形态确认：突破K线自身必须强劲，拒绝假突破的长上影线
+        if today_candle['close'] <= today_candle['open']:
+            return False, "突破日非阳线"
+            
+        candle_range = today_candle['high'] - today_candle['low']
+        if candle_range < 1e-9: 
+            return True, "一字板涨停突破，最强信号" # 特殊情况
+        
+        candle_body = today_candle['close'] - today_candle['open']
+        if (candle_body / candle_range) < self.breakout_candle_strength_ratio:
+            return False, f"突破日K线实体过弱(占比 < {self.breakout_candle_strength_ratio:.0%})，买盘存疑"
+
+        # ★★★ 结构性突破确认！★★★
+        return True, f"日线放量强实体阳线，突破颈线 {neckline_price:.2f}"
+    
+# ==============================================================================
+# === 【买入策略】MACD霸主策略 (高保真·日线抽象回测版) ===
+# ==============================================================================
+class MacdOverlordStrategyForBacktest(BacktestStrategy):
+    """
+    MACD霸主策略 (MACD Overlord Strategy) - [高保真·日线抽象回测版]
+    
+    核心哲学:
+    本回测策略100%忠于原版“多维时空共振”的交易哲学。我们深知，一个依赖
+    多时间框架的实盘策略，无法被简单地“复制-粘贴”到日线回测中。任何试图
+    在日线数据上模拟分钟级指标的行为，都是对专业精神的亵渎，是典型的
+    “刻舟求剑”。
+
+    因此，本策略采用“逻辑等价代换”的专业方法论，将原策略的四层猎杀过滤链
+    进行了高保真度的“降维”抽象：
+
+    - [战略层] 日线环境审查: 100% 复刻。这是日线级别的逻辑，无需改动。
+    
+    - [战术层] 60分钟结构确认 (抽象化):
+      - 原版意图: 寻找60分钟级别MACD在零轴上方的“健康盘整区”，即动能的
+                  “蓄力”状态。
+      - 日线等价物: 一个真正的“健康盘整区”，在日线图上必然体现为“价格
+                    波动收窄”与“成交量萎缩”。这是市场在为下一波行情积蓄
+                    能量的最直接证据。我们用量化的日线形态学和量能学指标，
+                    完美替代了60分钟MACD的表象。
+
+    - [执行层] 5分钟多维扳机 (抽象化):
+      - 原版意图: 在微观层面捕捉动能爆发的精确瞬间。
+      - 日线等价物: 一个微观动能的成功爆发，在当天收盘后，必然会铸就一根
+                    “强实体的、放量的、突破盘整区”的日线K线。这根K线本身
+                    就是对全天多空博弈结果的最终裁决，是5分钟级别所有复杂
+                    信号的“结果集”。
+
+    - [终审层] 微观二次呼吸审查 (逻辑融合):
+      - 原版意图: 过滤掉盘中的“假突破”毛刺。
+      - 日线等价物: 在日线回测中，我们无法预知“下一根K线”。因此，我们将
+                    此逻辑与执行层融合。一根满足我们极端苛刻条件的“执行层”
+                    突破阳线，其本身就隐含了“买盘稳固，空头无力反扑”的
+                    微观结构。一根完美的突破K线，就是最好的“二次呼吸”证明。
+
+    结论:
+    本回测策略，不是对原策略的拙劣模仿，而是对其内在交易思想的深刻理解与
+    逻辑重塑。它确保了每一次在回测中触发的信号，都与实盘策略所追求的那个
+    “多维时空共振点”，在交易逻辑上完全等价。这，才是专业回测的应有之义。
+    """
+    def __init__(self, data_handler, symbol_list, **kwargs):
+        """
+        构造函数。所有参数均可配置，这才是专业交易系统。
+        """
+        super().__init__(data_handler, symbol_list, **kwargs)
+        
+        # --- [1] 战略层参数 (日线) ---
+        self.daily_trend_ma_period: int = kwargs.get('daily_trend_ma_period', 50)
+        
+        # --- [2] 战术层(抽象)参数 ---
+        # 杠精注释: 我们不再需要MACD参数，而是定义“健康盘整区”的形态学参数
+        self.consolidation_lookback: int = kwargs.get('consolidation_lookback', 10) # 盘整区观察期（天）
+        self.consolidation_max_width_pct: float = kwargs.get('consolidation_max_width_pct', 0.10) # 盘整区最大波幅
+        self.volume_shrink_ratio: float = kwargs.get('volume_shrink_ratio', 0.8) # 成交量萎缩率
+        
+        # --- [3] 执行层(抽象)参数 ---
+        self.breakout_volume_multiplier: float = kwargs.get('breakout_volume_multiplier', 1.5) # 突破日成交量放大倍数
+        self.breakout_candle_strength_ratio: float = kwargs.get('breakout_candle_strength_ratio', 0.6) # 突破日K线实体强度
+        
+        # --- [4] 风控参数 ---
+        self.atr_period: int = kwargs.get('atr_period', 14) # 用于计算止损
+        self.atr_stop_loss_multiplier: float = kwargs.get('atr_stop_loss_multiplier', 2.0) # ATR止损倍数
+
+    @property
+    def name(self) -> str:
+        return "MACD霸主策略 (日线抽象回测版)"
+
+    def calculate_signals(self, event, held_symbols: list, positions: dict):
+        """
+        指挥中心：依次执行日线抽象版的猎杀过滤链。
+        """
+        if event.type != 'MARKET':
+            return
+
+        for s in self.symbol_list:
+            if s in held_symbols:
+                continue
+            
+            # --- 数据准备：一次性获取所有分析所需的数据 ---
+            # 需要 EMA周期 + 盘整周期 + ATR周期 的数据量
+            required_bars = self.daily_trend_ma_period + self.consolidation_lookback + self.atr_period + 20
+            df_daily = self.data_handler.get_latest_bars(s, N=required_bars)
+            if df_daily.empty or len(df_daily) < self.daily_trend_ma_period + self.consolidation_lookback + 5:
+                continue
+
+            # --- [第一层] 日线级别 · 环境审查 (100%复刻) ---
+            is_strategic_ok, strategic_data = self._check_strategic_filter_backtest(df_daily)
+            if not is_strategic_ok:
+                continue
+
+            # --- [第二层] 日线级别 · 结构确认 (高保真抽象) ---
+            is_tactical_ok, tactical_data = self._check_tactical_filter_backtest(strategic_data['df_with_ema'])
+            if not is_tactical_ok:
+                continue
+                
+            # --- [第三/四层] 日线级别 · 突破确认 (高保真抽象 & 逻辑融合) ---
+            is_triggered, trigger_msg = self._check_execution_trigger_backtest(tactical_data['df_consolidated'], tactical_data)
+            if not is_triggered:
+                continue
+
+            # ★★★ 如果所有过滤链都通过，则生成买入信号 ★★★
+            current_timestamp = df_daily.index[-1]
+            
+            # --- 信号确认，计算科学止损价 ---
+            stop_loss_price = self.calculate_atr_stop_loss(
+                df_daily,
+                atr_stop_loss_multiplier=self.atr_stop_loss_multiplier,
+                atr_period=self.atr_period
+            )
+            
+            # 杠精铁律: 没有科学止损的交易，就是赌博。
+            if stop_loss_price is None:
+                continue
+
+            print(
+                f"[{current_timestamp.strftime('%Y-%m-%d')}] ★★★ MACD霸主·买入信号 ★★★\n"
+                f"  - 股票: {s}\n"
+                f"  - 信号详情: {trigger_msg}\n"
+                f"  - 科学止损价: {stop_loss_price:.2f}"
+            )
+            signal = SignalEvent(s, current_timestamp, 'LONG', strategy_name=self.name, stop_loss_price=stop_loss_price)
+            events.put(signal)
+
+    def _check_strategic_filter_backtest(self, df: pd.DataFrame) -> Tuple[bool, Optional[Dict]]:
+        """
+        [战略层] 检查日线宏观趋势。逻辑与实盘100%一致。
+        """
+        try:
+            df_copy = df.copy()
+            df_copy['ema_long'] = ta.ema(df_copy['close'], length=self.daily_trend_ma_period)
+            latest = df_copy.iloc[-1]
+
+            if pd.isna(latest['ema_long']):
+                return False, None
+            
+            # 条件: 价格必须运行在长期生命线之上
+            if latest['close'] < latest['ema_long']:
+                return False, None
+            
+            return True, {"df_with_ema": df_copy}
+        except Exception:
+            return False, None
+
+    def _check_tactical_filter_backtest(self, df: pd.DataFrame) -> Tuple[bool, Optional[Dict]]:
+        """
+        [战术层-抽象版] 检查日线级别的“健康盘整区”。
+        我们用“价格波动收窄”与“成交量萎缩”来量化定义。
+        """
+        try:
+            # 我们审查的是“今天”之前的那个阶段
+            consolidation_df = df.iloc[-(self.consolidation_lookback + 1):-1]
+            if len(consolidation_df) < self.consolidation_lookback:
+                return False, None
+
+            # --- 形态学检查: 价格波动是否收窄 ---
+            platform_high = consolidation_df['high'].max()
+            platform_low = consolidation_df['low'].min()
+            if platform_low <= 0: return False, None # 避免除零
+            
+            platform_width_pct = (platform_high - platform_low) / platform_low
+            if platform_width_pct > self.consolidation_max_width_pct:
+                return False, None # 波动太大，不是“紧凑”的盘整
+            
+            # --- 量能学检查: 成交量是否萎缩 ---
+            # 杠精注释: 专业的盘整必然伴随流动性枯竭，这是大资金吸筹或洗盘的特征。
+            avg_volume_in_platform = consolidation_df['volume'].mean()
+            # 用更长期的均量作为基准
+            long_term_avg_volume = df['volume'].iloc[-(self.daily_trend_ma_period + 1):-1].mean()
+            
+            if avg_volume_in_platform > long_term_avg_volume * self.volume_shrink_ratio:
+                 return False, None # 盘整期成交量没有显著萎缩
+            
+            # 盘整区通过审查
+            return True, {
+                "df_consolidated": df,
+                "platform_high": platform_high,
+                "platform_avg_volume": long_term_avg_volume
+            }
+        except Exception:
+            return False, None
+            
+    def _check_execution_trigger_backtest(self, df: pd.DataFrame, tactical_data: Dict) -> Tuple[bool, str]:
+        """
+        [执行层 & 终审层-融合抽象版] 检查“今天”的K线是否为一根高质量的突破阳线。
+        一根完美的突破K线，就是对所有微观买入信号的最终确认。
+        """
+        breakout_candle = df.iloc[-1]
+        platform_high = tactical_data['platform_high']
+        volume_benchmark = tactical_data['platform_avg_volume']
+        
+        # --- 扳机条件 1: 价格突破 ---
+        # 收盘价必须决定性地站上盘整区高点
+        if breakout_candle['close'] <= platform_high:
+            return False, ""
+
+        # --- 扳机条件 2: 成交量确认 ---
+        # 成交量必须显著放大，没有成交量的突破都是耍流氓。
+        if breakout_candle['volume'] < volume_benchmark * self.breakout_volume_multiplier:
+            return False, ""
+
+        # --- 扳机条件 3 (融合终审层): K线形态确认 ---
+        # 突破K线自身必须强劲，拒绝假突破的长上影线。
+        if breakout_candle['close'] <= breakout_candle['open']:
+            return False, "" # 必须是阳线
+            
+        candle_range = breakout_candle['high'] - breakout_candle['low']
+        if candle_range < 1e-9: return True, "一字板涨停突破" # 特殊情况，视为最强信号
+        
+        candle_body = breakout_candle['close'] - breakout_candle['open']
+        # 实体占比必须超过阈值，这保证了买盘从开盘到收盘都占据主导
+        if (candle_body / candle_range) < self.breakout_candle_strength_ratio:
+            return False, "" # 实体过弱，买盘后继乏力，可能是陷阱
+
+        # 所有条件满足，这才是值得下注的、多维共振的交易机会
+        msg = f"日线放量突破(Vol x{self.breakout_volume_multiplier:.1f})强实体阳线，突破 {self.consolidation_lookback}日 盘整高点({platform_high:.2f})"
+        return True, msg
+    
 # ==============================================================================
 # === 【V2.0 修复版】“禁卫军”全天候作战平台 (回测专用版) ===
 # ==============================================================================
@@ -459,11 +1514,13 @@ class MacdReversalStrategyForBacktest(BacktestStrategy):
     - 移除了实盘特有的`_is_valid_time`和`cache_manager`，因为回测环境不需要。
     - 简化了确认逻辑，在日线回测中，如果当天出现背离信号，则视为有效。
     """
+    DEFAULT_PRIMARY_PERIOD_MINUTES = 60
+
     def __init__(self, data_handler, symbol_list, **kwargs):
         super().__init__(data_handler, symbol_list, **kwargs)
         self.k_period_minutes = kwargs.get('k_period_minutes', 60) # 默认为60分钟
+        self.primary_period_key = normalize_period_key(self.k_period_minutes)
         self.atr_period = kwargs.get('atr_period', 14)
-        # 杠精注释：在日线回测中，分钟周期参数没有意义，但我们保留它以与实盘策略对应。
 
     @property
     def name(self):
@@ -474,26 +1531,34 @@ class MacdReversalStrategyForBacktest(BacktestStrategy):
 
         for s in self.symbol_list:
             if s in held_symbols: continue
+            if not self.has_new_bar(s): continue
                 
-            df_daily = self.data_handler.get_latest_bars(s, N=150) # MACD需要较多数据预热
-            if df_daily.empty or len(df_daily) < 80: continue
+            df_signal = self.get_latest_bars(s, N=150) # MACD需要较多数据预热
+            if df_signal.empty or len(df_signal) < 80: continue
 
-            signal_df = self._calculate_signals_backtest(df_daily)
+            signal_df = self._calculate_signals_backtest(df_signal)
             
-            # 我们只关心最新一天（最后一行）是否有信号
+            # 我们只关心最新一根已收盘K线是否有信号
             if not signal_df.empty and signal_df.iloc[-1]['buy_signal'] == 1:
-                current_timestamp = df_daily.index[-1]
-                # --- 最终确认：对突破日的K线进行质量审查 ---
-                # is_confirmed, _ = self.final_confirmation_backtest(df_daily)
-                # if not is_confirmed: continue
+                current_timestamp = df_signal.index[-1]
+                is_confirmed, _ = self.final_confirmation_backtest(df_signal)
+                if not is_confirmed: continue
                 
                 print(
-                    f"[{current_timestamp.strftime('%Y-%m-%d')}] ★★★ 买入信号 ★★★\n"
+                    f"[{current_timestamp.strftime('%Y-%m-%d %H:%M')}] ★★★ 买入信号 ★★★\n"
                     f"  - 股票: {s}\n"
                     f"  - 原因: {self.name}"
                 )
-                stop_loss_price = self.calculate_atr_stop_loss(df_daily)
-                signal = SignalEvent(s, current_timestamp, 'LONG', strategy_name=self.name,stop_loss_price=stop_loss_price)
+                df_daily = self.data_handler.get_latest_bars(s, N=self.atr_period + 20, period=DAY_PERIOD_KEY)
+                stop_loss_price = self.calculate_atr_stop_loss(df_daily, atr_period=self.atr_period)
+                signal = SignalEvent(
+                    s,
+                    current_timestamp,
+                    'LONG',
+                    strategy_name=self.name,
+                    stop_loss_price=stop_loss_price,
+                    period=self.primary_period_key
+                )
                 events.put(signal)
     
     def _calculate_signals_backtest(self, symbol_k_df: pd.DataFrame) -> pd.DataFrame:
@@ -591,7 +1656,7 @@ class MacdReversalStrategyForBacktest(BacktestStrategy):
 # ==============================================================================
 # === 【买入策略】三重共振MACD反转Pro (回测专用版) ===
 # ==============================================================================
-class MacdReversalStrategyProForBacktest(BacktestStrategy):
+class _MacdReversalStrategyProDailyPrototypeForBacktest(BacktestStrategy):
     """
     三重共振Pro策略的回测专用版。
     - 忠实复现了宏观结构审查和高质量背离筛选。
@@ -718,6 +1783,467 @@ class MacdReversalStrategyProForBacktest(BacktestStrategy):
         last_low_price = df['low'].iloc[last_price_trough_pos]
         return True, f"高质量背离: 价格新低({last_low_price:.2f}) + DIF更高 + 成交量萎缩"
     
+# ==============================================================================
+# === 【买入策略】动态周期MACD趋势反转Pro (高保真回测版) ===
+# ==============================================================================
+class MacdReversalStrategyProForBacktest(BacktestStrategy):
+    """
+    线上 MacdReversalStrategyPro 的高保真回测实现。
+
+    三层结构:
+    1. 日线趋势过滤，避免在主跌浪里接底背离。
+    2. 主周期 MACD 底背离，先用 V3 波谷引擎，再用传统死叉切片引擎兜底。
+    3. 5分钟 EMA20 企稳确认，替代线上实时 toolbox/cache 流程。
+    """
+    DEFAULT_PRIMARY_PERIOD_MINUTES = 60
+    DEFAULT_REQUIRED_PERIODS = ['5m', DAY_PERIOD_KEY]
+
+    def __init__(self, data_handler, symbol_list, **kwargs):
+        super().__init__(data_handler, symbol_list, **kwargs)
+        self.k_period_minutes = kwargs.get('k_period_minutes', self.DEFAULT_PRIMARY_PERIOD_MINUTES)
+        if self.k_period_minutes not in [10, 15, 30, 60, 120, 180, 240, 720, 1440]:
+            raise ValueError(
+                f"不支持的K线周期: {self.k_period_minutes}。"
+                "只支持 [10, 15, 30, 60, 120, 180, 240, 720, 1440]。"
+            )
+
+        self.primary_period_key = normalize_period_key(self.k_period_minutes)
+        self.primary_period_minutes = period_key_to_minutes(self.primary_period_key)
+        self.confirmation_period_key = normalize_period_key(kwargs.get('confirmation_period', '5m'))
+
+        self.daily_long_ema_period = kwargs.get('daily_long_ema_period', 60)
+        self.confirmation_5min_ema_period = kwargs.get('confirmation_5min_ema_period', 20)
+        self.atr_period = kwargs.get('atr_period', 14)
+        self.atr_stop_loss_multiplier = kwargs.get('atr_stop_loss_multiplier', 2.0)
+        self.signal_lookback = kwargs.get('signal_lookback', 150)
+        self.min_signal_bars = kwargs.get('min_signal_bars', 80)
+        self.signal_valid_bars = kwargs.get('signal_valid_bars', 2)
+        self.confirmation_lookback = kwargs.get('confirmation_lookback', 12)
+        self.confirmation_close_position_ratio = kwargs.get('confirmation_close_position_ratio', 0.55)
+        self.confirmation_reclaim_pct = kwargs.get('confirmation_reclaim_pct', 0.001)
+        self.confirmation_volume_ratio = kwargs.get('confirmation_volume_ratio', 0.0)
+        self.require_daily_filter = kwargs.get('require_daily_filter', True)
+        self.allow_scout_without_confirmation = kwargs.get('allow_scout_without_confirmation', True)
+
+        self.current_buy_percentage = 0.0
+        self.current_signal_quality = 0.0
+        self.is_final_confirmation = False
+
+    @property
+    def name(self):
+        return f"MACD趋势反转Pro(买入-{self.k_period_minutes}min-回测版)"
+
+    @property
+    def buy_percentage(self) -> float:
+        return self.current_buy_percentage
+
+    @property
+    def final_confirmation(self) -> bool:
+        return self.is_final_confirmation
+
+    def calculate_signals(self, event, held_symbols: list, positions: dict):
+        if event.type != 'MARKET': return
+
+        for s in self.symbol_list:
+            if s in held_symbols: continue
+            if not self.has_new_bar(s): continue
+
+            is_macro_ok, macro_msg = self._check_daily_uptrend_filter_backtest(s)
+            if not is_macro_ok:
+                continue
+
+            df_signal = self.get_latest_bars(s, N=self.signal_lookback)
+            if df_signal.empty or len(df_signal) < self.min_signal_bars:
+                continue
+
+            signal_source = 'v2'
+            signal_df = self._calculate_signals_v2(df_signal)
+            latest_signal = self._get_latest_valid_signal(signal_df, df_signal)
+
+            if latest_signal is None:
+                signal_df = self._calculate_signals_legacy(df_signal)
+                latest_signal = self._get_latest_valid_signal(signal_df, df_signal)
+                if latest_signal is None:
+                    continue
+                signal_source = 'legacy'
+
+            signal_time, signal_row = latest_signal
+            is_confirmed, confirmation_msg = self._final_confirmation_backtest(s, signal_time=signal_time)
+
+            if signal_source == 'legacy':
+                if not is_confirmed:
+                    continue
+                self._set_buy_params_scout()
+                signal_quality_msg = "传统死叉引擎命中，5分钟企稳确认通过，按侦察兵仓位建仓"
+            elif is_confirmed:
+                self._set_buy_params()
+                signal_quality_msg = "V3波谷引擎命中，5分钟企稳确认通过，按主力仓位建仓"
+            elif self.allow_scout_without_confirmation and self.k_period_minutes in (60, 120, 240):
+                self._set_buy_params_scout()
+                signal_quality_msg = "V3波谷引擎命中但5分钟未完全确认，按线上弱信号兜底逻辑建侦察兵仓"
+            else:
+                continue
+
+            decision_time = getattr(event, 'datetime', None) or df_signal.index[-1]
+            diagnosis = signal_row.get('diagnosis', 'MACD底背离')
+            print(
+                f"[{decision_time.strftime('%Y-%m-%d %H:%M')}] ★★★ 买入信号 ★★★\n"
+                f"  - 股票: {s}\n"
+                f"  - 策略: {self.name}\n"
+                f"  - 周期: {self.primary_period_key}\n"
+                f"  - 信号时间: {signal_time.strftime('%Y-%m-%d %H:%M')}\n"
+                f"  - 信号来源: {signal_source}\n"
+                f"  - 宏观过滤: {macro_msg}\n"
+                f"  - 背离诊断: {diagnosis}\n"
+                f"  - 最终确认: {confirmation_msg}\n"
+                f"  - 仓位逻辑: {signal_quality_msg}"
+            )
+
+            stop_loss_price = self._calculate_atr_stop_loss_for_entry(s, df_signal.iloc[-1]['close'])
+            events.put(SignalEvent(
+                s,
+                decision_time,
+                'LONG',
+                strength=self.current_buy_percentage,
+                strategy_name=self.name,
+                stop_loss_price=stop_loss_price,
+                period=self.primary_period_key,
+                execution_period=self.confirmation_period_key
+            ))
+
+    def _set_buy_params(self):
+        percentage_map = {
+            30: 0.15 * 2,
+            60: 0.20 * 2,
+            120: 0.25 * 2,
+            180: 0.25 * 2,
+            240: 0.30 * 2,
+            720: 0.35 * 2,
+            1440: 0.35 * 2,
+        }
+        quality_map = {
+            30: 50.0,
+            60: 60.0,
+            120: 70.0,
+            180: 70.0,
+            240: 75.0,
+            720: 80.0,
+            1440: 80.0,
+        }
+        self.current_buy_percentage = percentage_map.get(self.k_period_minutes, 0.20)
+        self.current_signal_quality = quality_map.get(self.k_period_minutes, 55.0)
+        self.is_final_confirmation = True
+
+    def _set_buy_params_scout(self):
+        percentage_map = {
+            30: 0.08 * 2,
+            60: 0.10 * 2,
+            120: 0.12 * 2,
+            180: 0.12 * 2,
+            240: 0.15 * 2,
+            720: 0.18 * 2,
+            1440: 0.18 * 2,
+        }
+        quality_map = {
+            30: 35.0,
+            60: 45.0,
+            120: 55.0,
+            180: 55.0,
+            240: 60.0,
+            720: 65.0,
+            1440: 65.0,
+        }
+        self.current_buy_percentage = percentage_map.get(self.k_period_minutes, 0.10)
+        self.current_signal_quality = quality_map.get(self.k_period_minutes, 40.0)
+        self.is_final_confirmation = False
+
+    def _get_latest_valid_signal(self, signal_df: pd.DataFrame, df_signal: pd.DataFrame):
+        if signal_df is None or signal_df.empty or 'buy_signal' not in signal_df.columns:
+            return None
+
+        hits = signal_df[signal_df['buy_signal'] == 1].sort_index()
+        if hits.empty:
+            return None
+
+        signal_time = self._align_timestamp(hits.index[-1])
+        current_time = self._align_timestamp(df_signal.index[-1])
+        if signal_time > current_time:
+            return None
+
+        max_delay = pd.Timedelta(minutes=self.primary_period_minutes * self.signal_valid_bars)
+        if current_time - signal_time > max_delay:
+            return None
+        return signal_time, hits.iloc[-1]
+
+    def _align_timestamp(self, value):
+        ts = pd.Timestamp(value)
+        if ts.tzinfo is None:
+            return ts.tz_localize('UTC')
+        return ts
+
+    def _calculate_atr_stop_loss_for_entry(self, symbol: str, entry_reference_price: float) -> Optional[float]:
+        df_daily = self.data_handler.get_latest_bars(symbol, N=self.atr_period + 20, period=DAY_PERIOD_KEY)
+        if df_daily.empty or len(df_daily) < self.atr_period + 2:
+            return None
+
+        df = df_daily.copy()
+        df['atr'] = ta.atr(df['high'], df['low'], df['close'], length=self.atr_period)
+        latest_atr = df['atr'].iloc[-1]
+        if pd.isna(latest_atr) or latest_atr <= 0:
+            return None
+        return float(entry_reference_price - latest_atr * self.atr_stop_loss_multiplier)
+
+    def _check_daily_uptrend_filter_backtest(self, symbol: str) -> Tuple[bool, str]:
+        if not self.require_daily_filter:
+            return True, "日线过滤已关闭"
+
+        df_daily = self.data_handler.get_latest_bars(
+            symbol,
+            N=max(100, self.daily_long_ema_period + 40),
+            period=DAY_PERIOD_KEY
+        )
+        if df_daily.empty or len(df_daily) < self.daily_long_ema_period + 5:
+            return False, "日线数据不足"
+
+        df = df_daily.copy()
+        df['ema20'] = ta.ema(df['close'], length=20)
+        df['ema60'] = ta.ema(df['close'], length=self.daily_long_ema_period)
+        macd = ta.macd(df['close'], fast=12, slow=26, signal=9)
+        if macd is None or macd.empty:
+            return False, "日线MACD计算失败"
+        df['dif'] = macd['MACD_12_26_9']
+        df.dropna(subset=['ema20', 'ema60', 'dif'], inplace=True)
+        if df.empty:
+            return False, "日线趋势指标不足"
+
+        latest = df.iloc[-1]
+        if latest['close'] <= latest['ema60']:
+            return False, f"日线收盘价({latest['close']:.2f})未站上EMA{self.daily_long_ema_period}({latest['ema60']:.2f})"
+        if latest['ema20'] <= latest['ema60']:
+            return False, f"日线EMA20({latest['ema20']:.2f})未站上EMA{self.daily_long_ema_period}({latest['ema60']:.2f})"
+        if latest['dif'] < 0:
+            return False, f"日线MACD DIF({latest['dif']:.2f})仍在零轴下方"
+
+        return True, "日线趋势健康: 价格位于EMA60上方，EMA20>EMA60，MACD DIF在零轴上方"
+
+    def _final_confirmation_backtest(self, symbol: str, signal_time=None) -> Tuple[bool, str]:
+        df_5m = self.data_handler.get_latest_bars(
+            symbol,
+            N=self.confirmation_5min_ema_period + self.confirmation_lookback + 20,
+            period=self.confirmation_period_key
+        )
+        if df_5m.empty or len(df_5m) < self.confirmation_5min_ema_period + 3:
+            return False, f"{self.confirmation_period_key}确认数据不足"
+
+        if signal_time is not None and self.primary_period_key == DAY_PERIOD_KEY:
+            signal_day = self._align_timestamp(signal_time).normalize()
+            df_5m = df_5m[df_5m.index.normalize() <= signal_day]
+
+        df = df_5m.copy()
+        df['ema_confirm'] = ta.ema(df['close'], length=self.confirmation_5min_ema_period)
+        if self.confirmation_volume_ratio > 0:
+            df['volume_ma'] = ta.sma(df['volume'], length=20)
+        df.dropna(subset=['ema_confirm'], inplace=True)
+        if len(df) < self.confirmation_lookback:
+            return False, f"{self.confirmation_period_key}确认指标不足"
+
+        window = df.tail(self.confirmation_lookback).copy()
+        latest = window.iloc[-1]
+        prev = window.iloc[-2]
+
+        if latest['close'] <= latest['ema_confirm']:
+            return False, f"{self.confirmation_period_key}未站上EMA{self.confirmation_5min_ema_period}"
+
+        crossed_up = (
+            (window['close'].shift(1) <= window['ema_confirm'].shift(1)) &
+            (window['close'] > window['ema_confirm'])
+        ).fillna(False).any()
+        recently_reclaimed = crossed_up or (
+            prev['close'] <= prev['ema_confirm'] and latest['close'] > latest['ema_confirm']
+        )
+        if not recently_reclaimed:
+            return False, f"{self.confirmation_period_key}近期没有从EMA{self.confirmation_5min_ema_period}下方重新收复"
+
+        candle_range = latest['high'] - latest['low']
+        if candle_range > 1e-9:
+            close_position_ratio = (latest['close'] - latest['low']) / candle_range
+            if close_position_ratio < self.confirmation_close_position_ratio:
+                return False, f"{self.confirmation_period_key}收盘位置偏弱({close_position_ratio:.0%})"
+
+        momentum_ok = latest['close'] > prev['high'] or latest['close'] > latest['ema_confirm'] * (1 + self.confirmation_reclaim_pct)
+        if not momentum_ok:
+            return False, f"{self.confirmation_period_key}站上均线但动能不足"
+
+        if self.confirmation_volume_ratio > 0 and 'volume_ma' in window.columns:
+            volume_ma = latest.get('volume_ma')
+            if pd.notna(volume_ma) and latest['volume'] < volume_ma * self.confirmation_volume_ratio:
+                return False, f"{self.confirmation_period_key}确认量能不足"
+
+        return True, (
+            f"{self.confirmation_period_key}重新站上EMA{self.confirmation_5min_ema_period}，"
+            "收盘位置和短线动能确认"
+        )
+
+    def _calculate_signals_v2(self, df_min: pd.DataFrame) -> pd.DataFrame:
+        if len(df_min) < 35:
+            return pd.DataFrame()
+
+        df = df_min.copy()
+        macd = ta.macd(df['close'], fast=12, slow=26, signal=9)
+        if macd is None or macd.empty:
+            return pd.DataFrame()
+
+        df['dif'] = macd['MACD_12_26_9']
+        df['rsi'] = ta.rsi(df['close'], length=14)
+        df['vol_ema'] = ta.ema(df['volume'], length=20)
+        df['atr14'] = ta.atr(df['high'], df['low'], df['close'], length=14)
+        df['rsi_q30'] = df['rsi'].rolling(window=60, min_periods=20).quantile(0.30)
+        df.dropna(inplace=True)
+        if len(df) < 20:
+            return pd.DataFrame()
+
+        price_prom = float(df['atr14'].tail(60).mean()) * 0.6
+        dif_prom = float(df['dif'].tail(60).std()) * 0.6
+        if price_prom <= 0 or pd.isna(price_prom):
+            price_prom = float(df['low'].std()) * 0.5
+        if dif_prom <= 0 or pd.isna(dif_prom):
+            dif_prom = float(df['dif'].std()) * 0.5
+
+        price_lows_indices, _ = find_peaks(-df['low'], distance=5, prominence=price_prom)
+        dif_lows_indices, _ = find_peaks(-df['dif'], distance=5, prominence=dif_prom)
+        if len(price_lows_indices) < 2 or len(dif_lows_indices) < 2:
+            return pd.DataFrame()
+
+        last_price_low_idx = price_lows_indices[-1]
+        prev_price_low_idx = price_lows_indices[-2]
+
+        try:
+            last_dif_low_idx = dif_lows_indices[np.argmin(np.abs(dif_lows_indices - last_price_low_idx))]
+            prev_dif_low_idx = dif_lows_indices[np.argmin(np.abs(dif_lows_indices - prev_price_low_idx))]
+        except IndexError:
+            return pd.DataFrame()
+
+        price_low_1 = df['low'].iloc[prev_price_low_idx]
+        price_low_2 = df['low'].iloc[last_price_low_idx]
+        dif_low_1 = df['dif'].iloc[prev_dif_low_idx]
+        dif_low_2 = df['dif'].iloc[last_dif_low_idx]
+
+        if not (price_low_2 < price_low_1 and dif_low_2 > dif_low_1):
+            return pd.DataFrame()
+
+        rsi_at_divergence = df['rsi'].iloc[last_price_low_idx]
+        rsi_threshold = df['rsi_q30'].iloc[last_price_low_idx]
+        if pd.isna(rsi_threshold):
+            rsi_threshold = 35.0
+        if rsi_at_divergence > rsi_threshold:
+            return pd.DataFrame()
+
+        volume_profile = df['volume'].iloc[prev_price_low_idx:last_price_low_idx + 1]
+        if volume_profile.mean() > df['vol_ema'].iloc[prev_price_low_idx]:
+            return pd.DataFrame()
+
+        signal_df = df.iloc[[last_price_low_idx]].copy()
+        signal_df['buy_signal'] = 1
+        signal_df['diagnosis'] = (
+            f"标准底背离: Price({price_low_1:.2f}->{price_low_2:.2f}), "
+            f"DIF({dif_low_1:.2f}->{dif_low_2:.2f}), "
+            f"RSI({rsi_at_divergence:.2f})"
+        )
+        return signal_df.sort_index(ascending=False)
+
+    def _calculate_signals_legacy(self, symbol_k_df: pd.DataFrame) -> pd.DataFrame:
+        try:
+            df_with_col = symbol_k_df.reset_index()
+            if 'timestamp' not in df_with_col.columns:
+                df_with_col = df_with_col.rename(columns={df_with_col.columns[0]: 'timestamp'})
+
+            bss = df_with_col.rename(columns={'timestamp': 'date_1min'})
+            bss = bss.sort_values(by='date_1min', ascending=True).reset_index(drop=True)
+            bss['index_no'] = bss.index
+            bss = bss[['index_no', 'date_1min', 'close']].copy()
+
+            bss['ema_12'] = ta.ema(bss['close'], length=12)
+            bss['ema_26'] = ta.ema(bss['close'], length=26)
+            bss['ema_d'] = bss['ema_12'] - bss['ema_26']
+            bss['ema_a'] = ta.ema(bss['ema_d'], length=9)
+            bss['ema_m'] = (bss['ema_d'] - bss['ema_a']) * 2
+            bss['ema_m_shift_1'] = bss['ema_m'].shift(1)
+
+            def _ema_turn_point(r):
+                if pd.isna(r.ema_m_shift_1) or pd.isna(r.ema_m): return 0
+                if r.ema_m_shift_1 >= 0 and r.ema_m < 0: return -1
+                if r.ema_m_shift_1 <= 0 and r.ema_m > 0: return 1
+                return 0
+            bss['ema_turn_point'] = bss.apply(_ema_turn_point, axis=1)
+
+            tp_list = bss['ema_turn_point'].to_list()
+            def _barslast(r):
+                idx = int(r.index_no)
+                rev = tp_list[0: idx + 1][::-1]
+                n1 = next((i for i, v in enumerate(rev) if v == -1), -1)
+                mm1 = next((i for i, v in enumerate(rev) if v == 1), -1)
+                return n1, mm1
+            bss[['n1_days', 'mm1_days']] = bss.apply(_barslast, axis=1, result_type='expand')
+
+            close_list = bss['close'].to_list()
+            def _llv(r, values):
+                idx, n1 = int(r.index_no), int(r.n1_days)
+                if n1 < 0: return -1
+                return min(values[idx - n1: idx + 1])
+            def _ref(r, values):
+                idx, mm1 = int(r.index_no), int(r.mm1_days)
+                ref_idx = idx - mm1 - 1
+                if mm1 < 0 or ref_idx < 0: return -1
+                return values[ref_idx]
+
+            bss['cc1'] = bss.apply(_llv, values=close_list, axis=1)
+            bss['cc2'] = bss.apply(_ref, values=bss['cc1'].to_list(), axis=1)
+            bss['cc3'] = bss.apply(_ref, values=bss['cc2'].to_list(), axis=1)
+
+            ema_d_list = bss['ema_d'].to_list()
+            bss['dif_l1'] = bss.apply(_llv, values=ema_d_list, axis=1)
+            bss['dif_l2'] = bss.apply(_ref, values=bss['dif_l1'].to_list(), axis=1)
+            bss['dif_l3'] = bss.apply(_ref, values=bss['dif_l2'].to_list(), axis=1)
+
+            def _aaa(r):
+                if pd.isna(r.ema_m_shift_1) or pd.isna(r.ema_d): return 0
+                return 1 if (r.cc1 < r.cc2 and r.dif_l1 > r.dif_l2 and r.ema_m_shift_1 < 0 and r.ema_d < 0) else 0
+            bss['aaa'] = bss.apply(_aaa, axis=1)
+
+            def _bbb(r):
+                if pd.isna(r.ema_m_shift_1) or pd.isna(r.ema_d): return 0
+                return 1 if (r.cc1 < r.cc3 and r.dif_l1 < r.dif_l2 and r.dif_l1 > r.dif_l3 and r.ema_m_shift_1 < 0 and r.ema_d < 0) else 0
+            bss['bbb'] = bss.apply(_bbb, axis=1)
+
+            def _ccc(r):
+                if pd.isna(r.ema_d): return 0
+                return 1 if (r.aaa == 1 or r.bbb == 1) and r.ema_d < 0 else 0
+            bss['ccc'] = bss.apply(_ccc, axis=1)
+            bss['ccc_shift_1'] = bss['ccc'].shift(1)
+            bss['ema_d_1'] = bss['ema_d'].shift(1)
+
+            def _jjj(r):
+                if pd.isna(r.ccc_shift_1) or pd.isna(r.ema_d_1) or pd.isna(r.ema_d): return 0
+                return 1 if r.ccc_shift_1 == 1 and abs(r.ema_d_1) >= abs(r.ema_d * 1.01) else 0
+            bss['jjj'] = bss.apply(_jjj, axis=1)
+            bss['jjj_shift_1'] = bss['jjj'].shift(1)
+
+            def _buy_signal(r):
+                if pd.isna(r.jjj_shift_1) or pd.isna(r.jjj): return 0
+                return 1 if r.jjj_shift_1 == 0 and r.jjj == 1 else 0
+            bss['buy_signal'] = bss.apply(_buy_signal, axis=1)
+            bss['diagnosis'] = "传统死叉切片底背离"
+
+            return (
+                bss.rename(columns={'date_1min': 'timestamp'})
+                   .sort_values(by='timestamp', ascending=False)
+                   .set_index('timestamp')
+            )
+
+        except Exception as e:
+            print(f"[{self.name}] _calculate_signals_legacy 异常: {e}")
+            return pd.DataFrame()
+
 # ==============================================================================
 # === 【买入策略】动能延续策略 (回测专用版) ===
 # ==============================================================================
@@ -957,12 +2483,15 @@ class NarrativeWBottomStrategyForBacktest(BacktestStrategy):
         2. 将 `get_current_price` 调用替换为使用当日K线的收盘价。
         3. 将依赖5分钟K线的 `_final_confirmation` 抽象为对突破日K线本身的“质量审查”。
     """
+    DEFAULT_PRIMARY_PERIOD_MINUTES = 720
+
     def __init__(self, data_handler, symbol_list, **kwargs):
         super().__init__(data_handler, symbol_list, **kwargs)
         
         # --- 100% 复刻你的实盘策略核心参数 ---
          # 你的实盘代码默认值是720，我们100%保持一致。
         self.k_period_minutes = kwargs.get('k_period_minutes', 720)
+        self.primary_period_key = normalize_period_key(self.k_period_minutes)
 
         self.lookback_period = kwargs.get('lookback_period', 252)
         self.downtrend_ma_period = kwargs.get('downtrend_ma_period', 60)
@@ -987,30 +2516,32 @@ class NarrativeWBottomStrategyForBacktest(BacktestStrategy):
 
         for s in self.symbol_list:
             if s in held_symbols: continue
+            if not self.has_new_bar(s): continue
 
             # --- 数据准备：获取足够的回看数据 ---
             # 你的策略逻辑依赖于整数位置索引，所以我们一次性获取所有数据
-            df_daily = self.data_handler.get_latest_bars(s, N=self.lookback_period + self.downtrend_ma_period)
-            if df_daily.empty or len(df_daily) < self.downtrend_ma_period + 80:
+            df_signal = self.get_latest_bars(s, N=self.lookback_period + self.downtrend_ma_period)
+            if df_signal.empty or len(df_signal) < self.downtrend_ma_period + 80:
                 continue
 
             # --- 核心逻辑：寻找并验证W底反转剧本 ---
-            is_setup, setup_info = self._find_narrative_w_bottom_backtest(df_daily)
+            is_setup, setup_info = self._find_narrative_w_bottom_backtest(df_signal)
             
             if not is_setup: continue
             
             # --- 最终确认：对突破日的K线进行质量审查 ---
-            is_confirmed, _ = self.final_confirmation_backtest(df_daily)
+            is_confirmed, _ = self.final_confirmation_backtest(df_signal)
             if not is_confirmed: continue
 
             # ★★★ 所有剧本章节和最终确认均已通过 ★★★
-            current_timestamp = df_daily.index[-1]
-            print(f"[{current_timestamp.strftime('%Y-%m-%d')}] ★★★ 买入信号 ★★★ - {s} by {self.name}\n  - 叙事: {setup_info['trigger_msg']}")
+            current_timestamp = df_signal.index[-1]
+            print(f"[{current_timestamp.strftime('%Y-%m-%d %H:%M')}] ★★★ 买入信号 ★★★ - {s} by {self.name}\n  - 叙事: {setup_info['trigger_msg']}")
             
+            df_daily = self.data_handler.get_latest_bars(s, N=40, period=DAY_PERIOD_KEY)
             stop_loss_price = self.calculate_atr_stop_loss(df_daily)
             if stop_loss_price is None: continue
 
-            signal = SignalEvent(s, current_timestamp, 'LONG', strategy_name=self.name, stop_loss_price=stop_loss_price)
+            signal = SignalEvent(s, current_timestamp, 'LONG', strategy_name=self.name, stop_loss_price=stop_loss_price, period=self.primary_period_key)
             events.put(signal)
 
     def _find_narrative_w_bottom_backtest(self, df_with_dt_index: pd.DataFrame) -> Tuple[bool, Optional[Dict]]:
@@ -1214,25 +2745,30 @@ class MacdReversalSellStrategyForBacktest(BacktestStrategy):
     - 100% 移植了实盘代码中复杂的顶背离计算逻辑。
     - 移除了所有与分钟 K线、缓存、实时行情相关的部分，使其完全适用于日线回测。
     """
+    DEFAULT_PRIMARY_PERIOD_MINUTES = 1440
+
     def __init__(self, data_handler, symbol_list, **kwargs):
         super().__init__(data_handler, symbol_list, **kwargs)
+        self.k_period_minutes = kwargs.get('k_period_minutes', 1440)
+        self.primary_period_key = normalize_period_key(self.k_period_minutes)
     
     @property
     def name(self):
-        return "MACD顶背离卖出策略 (日线回测版)"
+        return f"MACD顶背离卖出策略 ({self.k_period_minutes}min-回测版)"
 
     def calculate_signals(self, event, held_symbols: list, positions: dict):
         if event.type != 'MARKET': return
 
         for s in held_symbols:
-            df_daily = self.data_handler.get_latest_bars(s, N=150)
-            if df_daily.empty or len(df_daily) < 80: continue
+            if not self.has_new_bar(s): continue
+            df_signal = self.get_latest_bars(s, N=150)
+            if df_signal.empty or len(df_signal) < 80: continue
 
-            signal_df = self._calculate_signals_backtest(df_daily)
+            signal_df = self._calculate_signals_backtest(df_signal)
             if not signal_df.empty and signal_df.iloc[-1]['sell_signal'] == 1:
-                current_timestamp = df_daily.index[-1]
-                print(f"[{current_timestamp.strftime('%Y-%m-%d')}] ◆◆◆ 卖出信号 ◆◆◆ - {s} by {self.name}")
-                signal = SignalEvent(s, current_timestamp, 'SHORT', strategy_name=self.name)
+                current_timestamp = df_signal.index[-1]
+                print(f"[{current_timestamp.strftime('%Y-%m-%d %H:%M')}] ◆◆◆ 卖出信号 ◆◆◆ - {s} by {self.name}")
+                signal = SignalEvent(s, current_timestamp, 'SHORT', strategy_name=self.name, period=self.primary_period_key)
                 events.put(signal)
                 
     
@@ -1331,8 +2867,12 @@ class ApexPredatorExitStrategyForBacktest(BacktestStrategy):
       如果在一个K线上同时满足了“MACD顶背离”和“梯子破位”，则视为最高确定性的
       “逻辑共振”信号，执行卖出。
     """
+    DEFAULT_PRIMARY_PERIOD_MINUTES = 1440
+
     def __init__(self, data_handler, symbol_list, **kwargs):
         super().__init__(data_handler, symbol_list, **kwargs)
+        self.k_period_minutes = kwargs.get('k_period_minutes', 1440)
+        self.primary_period_key = normalize_period_key(self.k_period_minutes)
         # 移植所有需要的参数
         self.n1 = kwargs.get('n1', 26)
         self.n2 = kwargs.get('n2', 89)
@@ -1342,33 +2882,44 @@ class ApexPredatorExitStrategyForBacktest(BacktestStrategy):
         self.avg_volume_period = kwargs.get('avg_volume_period', 20)
         self.atr_period = kwargs.get('atr_period', 14)
         # 实例化一个MACD卖出策略的计算逻辑，用于复用
-        self.macd_sell_calculator = MacdReversalSellStrategyForBacktest(data_handler, symbol_list)
+        self.macd_sell_calculator = MacdReversalSellStrategyForBacktest(
+            data_handler,
+            symbol_list,
+            k_period_minutes=self.k_period_minutes,
+        )
 
 
     @property
     def name(self):
-        return "尖兵-斩首策略 (日线回测版)"
+        return f"尖兵-斩首策略 ({self.k_period_minutes}min-回测版)"
 
     def calculate_signals(self, event, held_symbols: list, positions: dict):
         if event.type != 'MARKET': return
 
         for s in held_symbols:
+            if not self.has_new_bar(s): continue
             kline_count = self.n2 + self.avg_volume_period
-            df_daily = self.data_handler.get_latest_bars(s, N=kline_count + 50) # 多取50根用于MACD
-            if df_daily.empty or len(df_daily) < kline_count: continue
+            df_signal = self.get_latest_bars(s, N=kline_count + 50) # 多取50根用于MACD
+            if df_signal.empty or len(df_signal) < kline_count: continue
 
             # 1. [尖兵侦察] 检查MACD顶背离
-            signal_df = self._calculate_macd_sell_signal(df_daily)
+            signal_df = self._calculate_macd_sell_signal(df_signal)
             is_macd_divergence = not signal_df.empty and signal_df.iloc[-1]['sell_signal'] == 1
 
             # 2. [斩首确认] 检查梯子结构破位
-            is_breakdown, _ = self._check_ladder_breakdown(df_daily)
+            is_breakdown, _ = self._check_ladder_breakdown(df_signal)
             
             # 3. [逻辑共振]
             if is_macd_divergence and is_breakdown:
-                current_timestamp = df_daily.index[-1]
-                print(f"[{current_timestamp.strftime('%Y-%m-%d')}] ◆◆◆ 卖出信号 ◆◆◆ - {s} by {self.name}")
-                signal = SignalEvent(s, current_timestamp, 'SHORT', strategy_name=self.name)
+                current_timestamp = df_signal.index[-1]
+                print(f"[{current_timestamp.strftime('%Y-%m-%d %H:%M')}] ◆◆◆ 卖出信号 ◆◆◆ - {s} by {self.name}")
+                signal = SignalEvent(
+                    s,
+                    current_timestamp,
+                    'SHORT',
+                    strategy_name=self.name,
+                    period=self.primary_period_key,
+                )
                 events.put(signal)
     
     def _check_ladder_breakdown(self, df: pd.DataFrame) -> Tuple[bool, str]:
@@ -1404,6 +2955,7 @@ class ApexPredatorExitStrategyForBacktest(BacktestStrategy):
     
     def _calculate_ladder_indicators(self, df: pd.DataFrame) -> pd.DataFrame:
         """移植自 StructuralConvictionSellStrategy 的辅助方法"""
+        df = df.copy()
         df[f'blue_ladder_upper'] = ta.ema(df['high'], length=self.n1)
         df[f'blue_ladder_lower'] = ta.ema(df['low'], length=self.n1)
         df[f'yellow_ladder_upper'] = ta.ema(df['high'], length=self.n2)
