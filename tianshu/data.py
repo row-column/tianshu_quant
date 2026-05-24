@@ -8,6 +8,10 @@ from .event import MarketEvent, events
 from .periods import DAY_PERIOD_KEY, normalize_period_key, period_key_to_minutes
 from config.settings import DATA_PATH
 
+JUMP_FILTER_PERIODS = {"60m", "240m"}
+MAX_INTRADAY_PRICE_MULTIPLIER = 6.0
+MAX_INTRADAY_BAR_RANGE_MULTIPLIER = 10.0
+
 class DataHandler(ABC):
     @abstractmethod
     def get_latest_bars(self, symbol, N=1, period=None):
@@ -81,7 +85,54 @@ class HistoricDataHandler(DataHandler):
         if df.index.tz is None:
             df.index = df.index.tz_localize('UTC')
         df.sort_index(inplace=True)
-        return df
+        return self._clean_symbol_period_data(df, symbol, period_key)
+
+    def _clean_symbol_period_data(self, df, symbol, period_key):
+        df = df[~df.index.duplicated(keep='last')].copy()
+        ohlc_columns = [col for col in ['open', 'high', 'low', 'close'] if col in df.columns]
+        if len(ohlc_columns) < 4:
+            return df
+
+        for col in ohlc_columns:
+            df[col] = pd.to_numeric(df[col], errors='coerce')
+        valid_ohlc = df[ohlc_columns].notna().all(axis=1)
+        valid_ohlc &= (df[ohlc_columns] > 0).all(axis=1)
+        valid_ohlc &= df['high'] >= df['low']
+        cleaned = df.loc[valid_ohlc].copy()
+
+        if period_key in JUMP_FILTER_PERIODS and not cleaned.empty:
+            bar_range_multiple = cleaned['high'] / cleaned['low']
+            jump_from_previous = self._price_jump_multiple(cleaned['close'], cleaned['close'].shift(1))
+            jump_to_next = self._price_jump_multiple(cleaned['close'].shift(-1), cleaned['close'])
+            one_bar_spike = (
+                (jump_from_previous > MAX_INTRADAY_PRICE_MULTIPLIER)
+                & (jump_to_next > MAX_INTRADAY_PRICE_MULTIPLIER)
+            )
+            malformed_bar = bar_range_multiple > MAX_INTRADAY_BAR_RANGE_MULTIPLIER
+            cleaned = cleaned.loc[~(one_bar_spike | malformed_bar)].copy()
+            cleaned = self._keep_largest_contiguous_price_segment(cleaned)
+
+        removed = len(df) - len(cleaned)
+        if removed > 0:
+            print(f"[数据清洗] {symbol} {period_key}: 过滤 {removed} 根异常K线")
+        return cleaned
+
+    def _price_jump_multiple(self, left, right):
+        ratio = left / right
+        inverse_ratio = right / left
+        return pd.concat([ratio, inverse_ratio], axis=1).max(axis=1)
+
+    def _keep_largest_contiguous_price_segment(self, df):
+        if df.empty:
+            return df
+
+        jump_from_previous = self._price_jump_multiple(df['close'], df['close'].shift(1))
+        segment_ids = (jump_from_previous > MAX_INTRADAY_PRICE_MULTIPLIER).cumsum()
+        if segment_ids.max() == 0:
+            return df
+
+        segments = [segment for _, segment in df.groupby(segment_ids)]
+        return max(segments, key=lambda segment: (len(segment), segment.index[-1])).copy()
 
     def _open_and_load_data(self):
         combined_index = None
@@ -127,6 +178,25 @@ class HistoricDataHandler(DataHandler):
     def get_latest_bar(self, symbol, period=None):
         latest = self.get_latest_bars(symbol, N=1, period=period)
         return None if latest.empty else latest.iloc[0]
+
+    def get_next_bar_after(self, symbol, timestamp, period=None):
+        period_key = normalize_period_key(period)
+        try:
+            data = self.symbol_data[period_key][symbol]
+        except KeyError:
+            return None
+        if timestamp is None:
+            timestamp = self.current_time
+        if timestamp is None:
+            return None
+
+        timestamp = pd.Timestamp(timestamp)
+        if timestamp.tzinfo is None:
+            timestamp = timestamp.tz_localize('UTC')
+        else:
+            timestamp = timestamp.tz_convert('UTC')
+        future_data = data.loc[data.index > timestamp]
+        return None if future_data.empty else future_data.iloc[0]
 
     def _slice_to_current_time(self, data, period_key, current_time):
         if period_key == DAY_PERIOD_KEY and self.execution_period != DAY_PERIOD_KEY:

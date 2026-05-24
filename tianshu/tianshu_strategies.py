@@ -79,6 +79,8 @@ class BacktestStrategy:
             # 3. 计算单笔风险和止损价，公式与你实盘代码完全一致
             atr_defined_risk = yesterday_atr * atr_stop_loss_multiplier
             stop_loss_price = today_price - atr_defined_risk
+            # stop_loss_price = today_price * 0.96
+            print(f'止损比例：{round((today_price-stop_loss_price)*100/today_price,3)}%')
             return stop_loss_price
         except Exception as e:
             print(f"警告: ATR止损价计算失败. {e}")

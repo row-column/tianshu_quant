@@ -114,12 +114,13 @@ SYMBOLS_TO_DOWNLOAD_CN = ['688775.SH', '688981.SH', '002384.SZ', '300308.SZ',
 
 # symbol_list = SYMBOLS_TO_DOWNLOAD_HK + SYMBOLS_TO_DOWNLOAD_US
 symbol_list = list(dict.fromkeys(SYMBOLS_TO_DOWNLOAD_US))
+symbol_list = list(dict.fromkeys(SYMBOLS_TO_DOWNLOAD_CN))
 # symbol_list = SYMBOLS_TO_DOWNLOAD_CN
 # symbol_list = ['01810.HK', '00981.HK',"02899.HK","1211.HK","RBRK.US",'TMDX.US','IONQ.US','RKLB.US']
 
 initial_capital = 100000.0
 BACKTEST_START_DATE = "2026-02-18"
-BACKTEST_START_DATE = "2024-05-21"
+BACKTEST_START_DATE = "2025-05-21"
 BACKTEST_END_DATE = None
 data_handler_kwargs = {
     'start_date': BACKTEST_START_DATE,
@@ -146,31 +147,18 @@ sell_strategy_params = { 'ma_period': 20 }
 # 这是一个配置列表，每个元素都是一个字典，描述了如何构建一个策略
 # 历史组合配置保留在这里，便于以后切回原有多策略组合。
 strategies_to_run = [
-    # FT交易系统迁移：保守MA20突破买入 + 保守退出
-    # {
-    #     'class': ConservativeMA20BreakoutBuyStrategyForBacktest,
-    #     'params': {
-    #         'target_value_pct': 0.085,
-    #         'stop_loss_ratio': 0.07,
-    #     },
-    #     'data_periods': ['1d'],
-    # },
-    # {
-    #     'class': ConservativeExitStrategyForBacktest,
-    #     'data_periods': ['1d'],
-    # },
-
+    
     # 买入：MACD底背离，60分钟 / 240分钟 / 日线
     # {
     #     'class': MacdReversalStrategyForBacktest,
-    #     'params': {'k_period_minutes': 60},
-    #     'data_periods': ['60m', '1d'],
+    #     'params': {'k_period_minutes': 180},
+    #     'data_periods': ['180m', '1d'],
     # },
-    {
-        'class': MacdReversalStrategyForBacktest,
-        'params': {'k_period_minutes': 240},
-        'data_periods': ['240m', '1d'],
-    },
+    # {
+    #     'class': MacdReversalStrategyForBacktest,
+    #     'params': {'k_period_minutes': 240},
+    #     'data_periods': ['240m', '1d'],
+    # },
     {
         'class': MacdReversalStrategyForBacktest,
         'params': {'k_period_minutes': 1440},
@@ -232,16 +220,16 @@ strategies_to_run = [
     #     'data_periods': ['1d'],
     # },
     # 卖出：尖兵-斩首，60分钟 / 240分钟 / 日线
-    {
-        'class': ApexPredatorExitStrategyForBacktest,
-        'params': {'k_period_minutes': 60},
-        'data_periods': ['60m', '1d'],
-    },
-    {
-        'class': ApexPredatorExitStrategyForBacktest,
-        'params': {'k_period_minutes': 240},
-        'data_periods': ['240m', '1d'],
-    },
+    # {
+    #     'class': ApexPredatorExitStrategyForBacktest,
+    #     'params': {'k_period_minutes': 60},
+    #     'data_periods': ['60m', '1d'],
+    # },
+    # {
+    #     'class': ApexPredatorExitStrategyForBacktest,
+    #     'params': {'k_period_minutes': 240},
+    #     'data_periods': ['240m', '1d'],
+    # },
     # {
     #     'class': ApexPredatorExitStrategyForBacktest,
     #     'params': {'k_period_minutes': 1440},
@@ -267,6 +255,23 @@ strategies_to_run = [
     {
         'class': ConservativeExitStrategyForBacktest,
         'data_periods': ['1d'],
+    },
+    {
+        'class': MacdReversalStrategyForBacktest,
+        'params': {'k_period_minutes': 1440},
+        'data_periods': ['1d'],
+    },
+
+    # 卖出：MACD顶背离，60分钟 / 240分钟 / 日线
+    {
+        'class': MacdReversalSellStrategyForBacktest,
+        'params': {'k_period_minutes': 60},
+        'data_periods': ['60m', '1d'],
+    },
+    {
+        'class': MacdReversalSellStrategyForBacktest,
+        'params': {'k_period_minutes': 240},
+        'data_periods': ['240m', '1d'],
     },
 ]
 

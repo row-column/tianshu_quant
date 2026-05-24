@@ -50,6 +50,7 @@ class OrderEvent(Event):
         order_type,
         quantity,
         direction,
+        datetime=None,
         initial_risk=0.0,
         entry_strategy_name="",
         stop_loss_price=0.0,
@@ -62,6 +63,7 @@ class OrderEvent(Event):
         self.order_type = order_type # 'MKT'
         self.quantity = quantity
         self.direction = direction # 'BUY' 或 'SELL'
+        self.datetime = datetime
         self.initial_risk = initial_risk
         self.entry_strategy_name = entry_strategy_name
         self.stop_loss_price = stop_loss_price

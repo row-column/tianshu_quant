@@ -97,6 +97,8 @@ class Backtest:
                 else:
                     if event is not None:
                         if event.type == 'MARKET':
+                            if hasattr(self.broker, 'execute_pending_orders'):
+                                self._handle_fills(self.broker.execute_pending_orders(event))
                             held_symbols = self.portfolio.get_held_symbols()
                             # 构建一个包含完整持仓对象的字典
                             positions_map = {s: self.portfolio.get_position(s) for s in held_symbols}
@@ -110,11 +112,15 @@ class Backtest:
                         elif event.type == 'SIGNAL':
                             self.portfolio.on_signal(event)
                         elif event.type == 'ORDER':
-                            self.broker.execute_order(event)
+                            self._handle_fills(self.broker.execute_order(event))
                         elif event.type == 'FILL':
                             self.portfolio.on_fill(event)
         
         print("回测结束。")
+
+    def _handle_fills(self, fills):
+        for fill in fills or []:
+            self.portfolio.on_fill(fill)
 
     def simulate_trading(self,is_show:bool=False,output_file=None):
         self._run_backtest()

@@ -40,8 +40,11 @@ class Portfolio:
         # self.current_holdings = self._construct_current_holdings()
         self.equity_curve = self._construct_equity_curve()
         self.cash = initial_capital
+        self.reserved_cash = 0.0
         self.total = initial_capital
         self.stop_loss_ratio = 0.04
+        self.pending_buy_symbols = set()
+        self.order_cash_buffer = 0.003
         self.strategy_names = set()
         # self.buy_percentages = {
         #     "禁卫军策略(回测版)-闪电战": 1.0,
@@ -111,7 +114,15 @@ class Portfolio:
         if event.type != 'SIGNAL': return
         # --- 买入信号处理 ---
         if event.type == 'SIGNAL':
-            if event.signal_type == 'LONG' and event.symbol not in self.current_holdings:
+            if event.signal_type == 'LONG':
+                if event.symbol in self.current_holdings:
+                    return
+                if event.symbol in self.pending_buy_symbols:
+                    self._log_order_rejection(
+                        event,
+                        reason="同标的买单已在等待成交，拒绝重复开仓",
+                    )
+                    return
                 # --- 【核心修改】在这里计算 risk_per_share ---
                 execution_period = self._resolve_execution_period(event)
                 latest_bar = self.data_handler.get_latest_bars(event.symbol, N=1, period=execution_period)
@@ -146,12 +157,24 @@ class Portfolio:
                     )
                     return
 
+                available_cash = self._available_cash()
+                if available_cash <= 0:
+                    self._log_order_rejection(
+                        event,
+                        reason="可用现金不足，已被持仓或待成交买单占用",
+                        execution_period=execution_period,
+                        reserved_cash=self.reserved_cash,
+                        cash=self.cash,
+                    )
+                    return
+
                 target_value_pct = getattr(event, 'target_value_pct', None)
                 if target_value_pct is not None:
                     quantity_info = self._calculate_value_position_size(
                         price,
                         symbol=event.symbol,
                         target_value_pct=target_value_pct,
+                        available_cash=available_cash,
                         return_details=True,
                     )
                 else:
@@ -163,22 +186,29 @@ class Portfolio:
                         strategy_name=event.strategy_name,
                         signal_strength=getattr(event, 'strength', 1.0),
                         is_buy_percentage=False,
+                        available_cash=available_cash,
                         return_details=True,
                     )
                 quantity = quantity_info['final_quantity']
                 
                 if quantity > 0:
+                    reserved_cash = self._reserve_buy_order(event.symbol, price, quantity, available_cash)
+                    order_metadata = dict(getattr(event, 'metadata', {}) or {})
+                    order_metadata['reserved_cash'] = reserved_cash
+                    order_created_at = self._order_created_at(event)
+                    order_metadata.setdefault('signal_datetime', getattr(event, 'datetime', None))
                     # --- 【核心修改】将 risk_per_share 放入 OrderEvent ---
                     order = OrderEvent(event.symbol, 
                                        'MKT', 
                                        quantity,
                                        'BUY',
+                                       datetime=order_created_at,
                                        initial_risk=risk_per_share,
                                        entry_strategy_name=event.strategy_name,
                                        stop_loss_price=getattr(event, 'stop_loss_price', 0.0),
                                        period=execution_period,
                                        strategy_params=getattr(event, 'strategy_params', {}),
-                                       metadata=getattr(event, 'metadata', {})
+                                       metadata=order_metadata
                                        )
                     events.put(order)
                     # self.strategy_names.add(event.strategy_name)
@@ -224,17 +254,42 @@ class Portfolio:
                     )
                     return
                 execution_period = self._resolve_execution_period(event)
+                order_metadata = dict(getattr(event, 'metadata', {}) or {})
+                order_metadata.setdefault('signal_datetime', getattr(event, 'datetime', None))
                 order = OrderEvent(
                     event.symbol,
                     'MKT',
                     quantity,
                     'SELL',
                     period=execution_period,
+                    datetime=self._order_created_at(event),
                     strategy_params=getattr(event, 'strategy_params', {}),
-                    metadata=getattr(event, 'metadata', {}),
+                    metadata=order_metadata,
                 ) # 卖出时不需要风险参数
                 events.put(order)
     
+    def _order_created_at(self, event):
+        return self.data_handler.current_time or getattr(event, 'datetime', None)
+
+    def _available_cash(self) -> float:
+        return max(self.cash - self.reserved_cash, 0.0)
+
+    def _reserve_buy_order(self, symbol: str, price: float, quantity: int, available_cash: float) -> float:
+        reserved_cash = min(price * quantity * (1 + self.order_cash_buffer), max(available_cash, 0.0))
+        self.reserved_cash += reserved_cash
+        self.pending_buy_symbols.add(symbol)
+        return reserved_cash
+
+    def _release_buy_reservation(self, event) -> None:
+        metadata = getattr(event, 'metadata', {}) or {}
+        reserved_cash = metadata.get('reserved_cash', 0.0)
+        try:
+            reserved_cash = float(reserved_cash)
+        except (TypeError, ValueError):
+            reserved_cash = 0.0
+        self.reserved_cash = max(self.reserved_cash - max(reserved_cash, 0.0), 0.0)
+        self.pending_buy_symbols.discard(event.symbol)
+
     def _resolve_execution_period(self, event) -> str:
         period = getattr(event, 'execution_period', None)
         if period is None:
@@ -274,6 +329,7 @@ class Portfolio:
         strategy_name: str = None,
         signal_strength: float = 1.0,
         is_buy_percentage: bool = True,
+        available_cash: float | None = None,
         return_details: bool = False,
     ):
         """(逻辑简化，职责更清晰)"""
@@ -290,8 +346,9 @@ class Portfolio:
         raw_quantity = int(trade_risk_amount / risk_per_share)
         quantity = raw_quantity
         
-        if price * quantity > self.cash:
-            quantity = int(self.cash / price)
+        cash_limit = self._available_cash() if available_cash is None else max(available_cash, 0.0)
+        if price * quantity > cash_limit:
+            quantity = int(cash_limit / price)
             
         final_quantity, board_lot = self._round_to_board_lot(symbol, quantity)
         if return_details:
@@ -309,6 +366,7 @@ class Portfolio:
         price: float,
         symbol: str,
         target_value_pct: float,
+        available_cash: float | None = None,
         return_details: bool = False,
     ):
         try:
@@ -319,8 +377,9 @@ class Portfolio:
         target_trade_value = self.total * pct
         raw_quantity = int(target_trade_value / price)
         quantity = raw_quantity
-        if price * quantity > self.cash:
-            quantity = int(self.cash / price)
+        cash_limit = self._available_cash() if available_cash is None else max(available_cash, 0.0)
+        if price * quantity > cash_limit:
+            quantity = int(cash_limit / price)
         final_quantity, board_lot = self._round_to_board_lot(symbol, quantity)
         if return_details:
             return {
@@ -371,6 +430,17 @@ class Portfolio:
         if event.type != 'FILL': return
 
         if event.direction == 'BUY':
+            self._release_buy_reservation(event)
+            if event.symbol in self.current_holdings:
+                print(f"[成交拒绝] {event.symbol} BUY: 已持仓，拒绝覆盖原持仓")
+                return
+            total_cost = event.fill_cost + event.commission
+            if total_cost > self.cash + 1e-6:
+                print(
+                    f"[成交拒绝] {event.symbol} BUY: 成交时现金不足 "
+                    f"(cost={total_cost:.2f}, cash={self.cash:.2f})"
+                )
+                return
             # --- 【核心修改】创建持仓对象 ---
             position = BacktestPosition(
                 symbol=event.symbol,
@@ -384,7 +454,7 @@ class Portfolio:
                 strategy_params=getattr(event, 'strategy_params', {})
             )
             self.current_holdings[event.symbol] = position
-            self.cash -= (event.fill_cost + event.commission)
+            self.cash -= total_cost
         else: # SELL
             if event.symbol in self.current_holdings:
                 position = self.current_holdings[event.symbol]

@@ -104,6 +104,7 @@ SYMBOLS_TO_DOWNLOAD_CN = ['688775.SH', '688981.SH', '002384.SZ', '300308.SZ',
 
 # SYMBOLS_TO_DOWNLOAD = SYMBOLS_TO_DOWNLOAD_HK + SYMBOLS_TO_DOWNLOAD_US + SYMBOLS_TO_DOWNLOAD_CN
 SYMBOLS_TO_DOWNLOAD = SYMBOLS_TO_DOWNLOAD_US
+SYMBOLS_TO_DOWNLOAD = SYMBOLS_TO_DOWNLOAD_CN
 
 # 目标数据跨度。3 表示下载最近3年，即从 end_date 往前推3个自然年。
 YEARS_TO_DOWNLOAD = 2
@@ -116,6 +117,9 @@ FORCE_FULL_REFRESH = False
 
 # 保存前是否只保留目标日期范围内的数据。
 PRUNE_TO_TARGET_RANGE = True
+
+# 所有周期统一复权口径，避免日线和分钟线在拆股/合股后价格尺度不一致。
+DEFAULT_ADJUST_TYPE = AdjustType.ForwardAdjust
 
 # 可用写法：Period.Day、Period.Min_60、"1d"、"60m"、60、180、"5m"。
 DOWNLOAD_PERIODS = [
@@ -177,10 +181,7 @@ def _normalize_download_job(job):
         return {
             "period": period,
             "period_key": period_key,
-            "adjust_type": job.get(
-                "adjust_type",
-                AdjustType.ForwardAdjust if period_key == DAY_PERIOD_KEY else AdjustType.NoAdjust,
-            ),
+            "adjust_type": job.get("adjust_type", DEFAULT_ADJUST_TYPE),
             "trade_sessions": job.get("trade_sessions", TradeSessions.Intraday),
             "chunk_days": job.get("chunk_days"),
         }
@@ -190,7 +191,7 @@ def _normalize_download_job(job):
     return {
         "period": period,
         "period_key": period_key,
-        "adjust_type": AdjustType.ForwardAdjust if period_key == DAY_PERIOD_KEY else AdjustType.NoAdjust,
+        "adjust_type": DEFAULT_ADJUST_TYPE,
         "trade_sessions": TradeSessions.Intraday,
         "chunk_days": None,
     }
